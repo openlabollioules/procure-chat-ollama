@@ -2,8 +2,14 @@
 import OpenAI from "openai";
 import { getSchema, runSQL } from "./db.js";
 
-// --- Intitulés exacts extraits des fichiers -intitulés.xlsx (colonne A) ---
-// Ces libellés sont utilisés en priorité pour résoudre les colonnes dans DuckDB.
+/* =========================================================
+   Intitulés exacts (colonne A) des fichiers d'intitulés & samples
+   ---------------------------------------------------------
+   Vérifiés sur :
+   - Achat-samples.xlsx
+   - Décaissements depuis 2012-sample.xlsx
+   - Détails des lignes de Commandes-sample.xlsx
+   ========================================================= */
 const COLUMN_ALIASES = {
   achats: {
     order_no: [
@@ -22,36 +28,33 @@ const COLUMN_ALIASES = {
       "Description de la ligne", "Description Ligne"
     ],
     fourn: [
-      "Nom du fournisseur", "N° du fournisseur" // priorité au nom
+      "Nom du fournisseur", "N° du fournisseur"
     ],
-    // Pas de "Date de commande" explicite : on prend une date proxy
     date_cmd: [
       "Date d'approbation", "Date de validation", "Date de création", "Date promise"
     ]
   },
   decs: {
     order_no: [
-      "N° commande", "N° Commande"
+      "N° Commande", "N° commande"
     ],
     line_no: [
-      "N° ligne commande", "N° Ligne Commande"
+      "N° Ligne Commande", "N° ligne commande"
     ],
     date_pay: [
-      "Date règlement"
+      "Date règlement", "Date règlement "
     ],
     montant: [
-      "Montant règlement"
+      "Montant règlement", "Montant réglé"
     ]
   },
   details: {
-    // Fallback si la date de commande est absente d'Achats
     order_no: [
       "N° Commande", "N° commande"
     ],
     line_no: [
       "N° Ligne Commande", "N° ligne commande"
     ],
-    // Dates utiles (on privilégie Date engagement)
     date_cmd_candidates: [
       "Date engagement", "Date promesse", "Date estimée règlement"
     ],
@@ -61,14 +64,18 @@ const COLUMN_ALIASES = {
   }
 };
 
-// ---- Client LLM (Ollama via API OpenAI-compatible) ----
+/* =========================================================
+   Client LLM (Ollama via API OpenAI-compatible)
+   ========================================================= */
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || "ollama",
   baseURL: process.env.OPENAI_BASE_URL || "http://127.0.0.1:11434/v1",
 });
 const MODEL = process.env.OLLAMA_MODEL || "gpt-oss:20b";
 
-// ---- État en mémoire ----
+/* =========================================================
+   État en mémoire
+   ========================================================= */
 const state = {
   taxonomy: /** @type {Array<{category:string, subcategories:string[]}>} */ ([]),
   tables: { achats: null, decs: null, details: null },
@@ -76,10 +83,10 @@ const state = {
   builtAt: null,
 };
 
-// ---- Helpers ----
-function esc(id) {
-  return id.replace(/"/g, '""');
-}
+/* =========================================================
+   Helpers
+   ========================================================= */
+function esc(id) { return id.replace(/"/g, '""'); }
 function q(v) {
   if (v === null || v === undefined) return "NULL";
   const s = String(v).replace(/'/g, "''");
@@ -107,7 +114,7 @@ function findTable(schema, nameHints = [], requiredColsRegex = []) {
   return (scored[0]?.score || 0) > 0 ? scored[0].t : tables[0];
 }
 
-// Cherche une colonne par libellé officiel (match exact sur "original" ou le nom normalisé)
+// Cherche une colonne par libellé officiel (match exact sur "original" ou nom normalisé)
 function resolveByAliases(schema, table, aliases) {
   if (!table || !aliases?.length) return null;
   const cols = (schema[table] || []).map(c => ({
@@ -123,6 +130,7 @@ function resolveByAliases(schema, table, aliases) {
   return null;
 }
 
+// Appel LLM et lecture JSON sécurisée (accepte ```json ...```)
 async function llmJSON(messages) {
   const resp = await client.chat.completions.create({
     model: MODEL,
@@ -139,19 +147,46 @@ async function llmJSON(messages) {
   }
 }
 
-// ---- Construction du catalogue (taxonomie + mapping + paiements) ----
+// Normalise une clé (trim, upper, supprime espaces, supprime zéros de tête)
+const normKey = (expr) => `
+  NULLIF(
+    regexp_replace(
+      replace(upper(CAST(${expr} AS VARCHAR)), ' ', ''),
+      '^0+', ''
+    ),
+    ''
+  )
+`;
+
+// Conversion robuste vers DATE (DATE/TIMESTAMP, strings FR/ISO, nombres Excel)
+function sqlDateFromAny(expr) {
+    return `
+      COALESCE(
+        TRY_CAST(${expr} AS DATE),
+        CAST(TRY_CAST(${expr} AS TIMESTAMP) AS DATE),
+        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%Y-%m-%d') AS DATE),
+        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d/%m/%Y') AS DATE),
+        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d-%m-%Y') AS DATE),
+        DATE '1899-12-30' + CAST(ROUND(CAST(${expr} AS DOUBLE)) AS INTEGER)
+      )
+    `;
+  }
+  
+/* =========================================================
+   Build: taxonomie + classification + paiements
+   ========================================================= */
 export async function buildCatalog() {
   const schema = getSchema();
 
-  // 1) Identification des tables
-  const achatsTable = findTable(schema, ["achat","command"], [/type.*ligne/, /description.*commande/, /description.*ligne/]);
-  const decsTable   = findTable(schema, ["decaisse","regle","règle","paiem","reglement","règlement"], [/date.*(dec|reg|pai)/, /montant/]);
+  // 1) Tables
+  const achatsTable  = findTable(schema, ["achat","command"], [/type.*ligne/, /description.*commande/, /description.*ligne/]);
+  const decsTable    = findTable(schema, ["decaisse","regle","règle","paiem","reglement","règlement"], [/date.*(dec|reg|pai)/, /montant/]);
   const detailsTable = findTable(schema, ["detail","ligne","lines"], [/n.*commande/, /ligne.*commande/]);
 
   if (!achatsTable) throw new Error("Table Achats introuvable.");
   if (!decsTable) throw new Error("Table Décaissements introuvable.");
 
-  // 2) Colonnes nécessaires dans Achats — via intitulés exacts
+  // 2) Colonnes Achats (intitulés exacts en priorité)
   const A = {};
   A.order_no   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.order_no);
   A.line_no    = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.line_no);
@@ -159,22 +194,22 @@ export async function buildCatalog() {
   A.desc_cmd   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_cmd);
   A.desc_line  = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_line);
   A.fourn      = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.fourn);
-  A.date_cmd   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.date_cmd); // peut être null
+  A.date_cmd   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.date_cmd); // optionnelle
 
-  // 3) Colonnes nécessaires dans Décaissements — via intitulés exacts
+  // 3) Colonnes Décaissements
   const D = {};
   D.order_no = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.order_no);
   D.line_no  = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.line_no);
   D.montant  = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.montant);
   D.date_pay = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.date_pay);
 
-  // Vérifs minimales (sauf date_cmd qu'on tolère)
+  // Vérifs minimales (sauf date_cmd)
   const requiredA = ["order_no","line_no","type_ligne","desc_cmd","desc_line","fourn"];
   for (const k of requiredA) if (!A[k]) throw new Error(`Colonne Achats manquante: ${k}`);
   const requiredD = ["order_no","line_no","montant","date_pay"];
   for (const k of requiredD) if (!D[k]) throw new Error(`Colonne Décaissements manquante: ${k}`);
 
-  // Fallback date de commande via Détails (si dispo)
+  // Fallback date via Détails si dispo
   let dateFallback = null;
   if (!A.date_cmd && detailsTable) {
     const detOrder = resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.order_no);
@@ -185,7 +220,7 @@ export async function buildCatalog() {
     }
   }
 
-  // 4) Échantillon Achats pour construire la taxonomie (max 500 lignes)
+  // 4) Échantillon Achats -> taxonomie via LLM
   const sample = await runSQL(`
     SELECT "${esc(A.type_ligne)}" AS type_ligne,
            "${esc(A.desc_cmd)}"   AS desc_cmd,
@@ -211,12 +246,7 @@ Règles:
 - Description de la ligne
 
 Echantillon:
-${sample
-  .map(
-    (r) => `- [${r.type_ligne || ""}] ${r.desc_cmd || ""} | ${r.desc_line || ""}`
-  )
-  .join("\n")
-  .slice(0, 8000)}
+${sample.map(r => `- [${r.type_ligne || ""}] ${r.desc_cmd || ""} | ${r.desc_line || ""}`).join("\n").slice(0, 8000)}
 
 Rends uniquement le JSON demandé.`;
 
@@ -226,13 +256,11 @@ Rends uniquement le JSON demandé.`;
   ]);
 
   const taxonomy = (taxoJson.taxonomy || [])
-    .map((t) => ({
+    .map(t => ({
       category: String(t.category || "").trim(),
-      subcategories: (t.subcategories || [])
-        .map((s) => String(s || "").trim())
-        .filter(Boolean),
+      subcategories: (t.subcategories || []).map(s => String(s || "").trim()).filter(Boolean),
     }))
-    .filter((t) => t.category && t.subcategories.length);
+    .filter(t => t.category && t.subcategories.length);
 
   if (!taxonomy.length) throw new Error("Taxonomie vide renvoyée par le LLM.");
 
@@ -264,11 +292,11 @@ Rends uniquement le JSON demandé.`;
 
   for (let i = 0; i < lines.length; i += batchSize) {
     const chunk = lines.slice(i, i + batchSize);
-    const items = chunk.map((r) => ({
+    const items = chunk.map(r => ({
       key: `${r.order_no}|||${r.line_no}`,
       type_ligne: r.type_ligne || "",
-      desc_cmd: r.desc_cmd || "",
-      desc_line: r.desc_line || "",
+      desc_cmd:   r.desc_cmd   || "",
+      desc_line:  r.desc_line  || "",
       fournisseur: r.fournisseur || "",
     }));
 
@@ -297,11 +325,10 @@ Rends UNIQUEMENT le JSON demandé.`;
 
     for (const m of rowsToInsert) {
       const [order_no, line_no] = String(m.key || "").split("|||");
-      const category = String(m.category || "").trim();
-      const subcategory = String(m.subcategory || "").trim();
+      const category   = String(m.category || "").trim();
+      const subcategory= String(m.subcategory || "").trim();
       if (!order_no || !line_no || !category || !subcategory) continue;
-      const fournisseur =
-        chunk.find((r) => `${r.order_no}|||${r.line_no}` === m.key)?.fournisseur || "";
+      const fournisseur = (chunk.find(r => `${r.order_no}|||${r.line_no}` === m.key)?.fournisseur) || "";
 
       const insertSQL = `
         INSERT INTO catalog_line_map (order_no, line_no, category, subcategory, fournisseur)
@@ -311,7 +338,7 @@ Rends UNIQUEMENT le JSON demandé.`;
     }
   }
 
-  // 6) Calcul des paiements liés + délais (date pay - date commande)
+  // 6) Paiements liés + délais (normalisation de clés + conversion robuste date)
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_payments (
       category VARCHAR,
@@ -329,57 +356,77 @@ Rends UNIQUEMENT le JSON demandé.`;
 
   await runSQL(`
     INSERT INTO catalog_payments
+    WITH a_norm AS (
+      SELECT
+        ${normKey(`a."${esc(A.order_no)}"`)} AS k_order,
+        ${normKey(`a."${esc(A.line_no)}"`)}  AS k_line,
+        a."${esc(A.fourn)}" AS fournisseur,
+        CAST(a."${esc(A.order_no)}" AS VARCHAR) AS order_no_raw,
+        CAST(a."${esc(A.line_no)}"  AS VARCHAR) AS line_no_raw,
+        ${
+          A.date_cmd
+            ? `${sqlDateFromAny(`a."${esc(A.date_cmd)}"`)}`
+            : (dateFallback
+                ? `(
+                     SELECT ${sqlDateFromAny(`dtl."${esc(dateFallback.col)}"`)}
+                     FROM "${esc(dateFallback.table)}" dtl
+                     WHERE ${normKey(`dtl."${esc(dateFallback.order_no)}"`)} = ${normKey(`a."${esc(A.order_no)}"`)}
+                       AND ${normKey(`dtl."${esc(dateFallback.line_no)}"`)}  = ${normKey(`a."${esc(A.line_no)}"`)}
+                     ORDER BY ${sqlDateFromAny(`dtl."${esc(dateFallback.col)}"`)} ASC
+                     LIMIT 1
+                   )`
+                : `NULL`
+              )
+        } AS order_date
+      FROM "${esc(achatsTable)}" a
+      JOIN catalog_line_map m
+        ON CAST(a."${esc(A.order_no)}" AS VARCHAR) = m.order_no
+       AND CAST(a."${esc(A.line_no)}"  AS VARCHAR) = m.line_no
+    ),
+    d_norm AS (
+      SELECT
+        ${normKey(`d."${esc(D.order_no)}"`)} AS k_order,
+        ${normKey(`d."${esc(D.line_no)}"`)}  AS k_line,
+        CAST(${sqlDateFromAny(`d."${esc(D.date_pay)}"`)} AS DATE) AS payment_date,
+        CAST(d."${esc(D.montant)}" AS DOUBLE) AS montant
+      FROM "${esc(decsTable)}" d
+      WHERE d."${esc(D.date_pay)}" IS NOT NULL
+        AND d."${esc(D.montant)}"  IS NOT NULL
+    )
     SELECT
       m.category,
       m.subcategory,
-      a."${esc(A.fourn)}" AS fournisseur,
-      CAST(a."${esc(A.order_no)}" AS VARCHAR) AS order_no,
-      CAST(a."${esc(A.line_no)}"  AS VARCHAR) AS line_no,
+      a_norm.fournisseur,
+      a_norm.order_no_raw AS order_no,
+      a_norm.line_no_raw  AS line_no,
+      a_norm.order_date,
+      d_norm.payment_date,
+      d_norm.montant,
       ${
-        A.date_cmd
-          ? `CAST(a."${esc(A.date_cmd)}" AS DATE)`
-          : dateFallback
-            ? `(SELECT CAST(MIN(dtl."${esc(dateFallback.col)}") AS DATE)
-                FROM "${esc(dateFallback.table)}" dtl
-                WHERE CAST(dtl."${esc(dateFallback.order_no)}" AS VARCHAR) = CAST(a."${esc(A.order_no)}" AS VARCHAR)
-                  AND CAST(dtl."${esc(dateFallback.line_no)}"  AS VARCHAR) = CAST(a."${esc(A.line_no)}"  AS VARCHAR))`
-            : `NULL`
-      } AS order_date,
-      CAST(d."${esc(D.date_pay)}" AS DATE)    AS payment_date,
-      CAST(d."${esc(D.montant)}"  AS DOUBLE)  AS montant,
-      ${
-        A.date_cmd
-          ? `datediff('day', CAST(a."${esc(A.date_cmd)}" AS DATE), CAST(d."${esc(D.date_pay)}" AS DATE))`
-          : dateFallback
-            ? `datediff('day',
-                 (SELECT CAST(MIN(dtl."${esc(dateFallback.col)}") AS DATE)
-                  FROM "${esc(dateFallback.table)}" dtl
-                  WHERE CAST(dtl."${esc(dateFallback.order_no)}" AS VARCHAR) = CAST(a."${esc(A.order_no)}" AS VARCHAR)
-                    AND CAST(dtl."${esc(dateFallback.line_no)}"  AS VARCHAR) = CAST(a."${esc(A.line_no)}"  AS VARCHAR)
-                 ),
-                 CAST(d."${esc(D.date_pay)}" AS DATE)
-               )`
-            : `NULL`
+        (A.date_cmd || dateFallback)
+          ? `datediff('day', a_norm.order_date, d_norm.payment_date)`
+          : `NULL`
       } AS delay_days
-    FROM "${esc(achatsTable)}" a
+    FROM a_norm
     JOIN catalog_line_map m
-      ON CAST(a."${esc(A.order_no)}" AS VARCHAR) = m.order_no
-     AND CAST(a."${esc(A.line_no)}"  AS VARCHAR) = m.line_no
-    JOIN "${esc(decsTable)}" d
-      ON CAST(a."${esc(A.order_no)}" AS VARCHAR) = CAST(d."${esc(D.order_no)}" AS VARCHAR)
-     AND CAST(a."${esc(A.line_no)}"  AS VARCHAR) = CAST(d."${esc(D.line_no)}"  AS VARCHAR)
-    WHERE d."${esc(D.date_pay)}" IS NOT NULL
-      AND d."${esc(D.montant)}"  IS NOT NULL;
+      ON a_norm.order_no_raw = m.order_no
+     AND a_norm.line_no_raw  = m.line_no
+    JOIN d_norm
+      ON a_norm.k_order = d_norm.k_order
+     AND (
+          (d_norm.k_line IS NOT NULL AND a_norm.k_line = d_norm.k_line)
+          OR (d_norm.k_line IS NULL)
+        );
   `);
 
-  // 7) Mettre à jour l'état
+  // 7) État
   state.taxonomy = taxonomy;
-  state.tables.achats = achatsTable;
-  state.tables.decs = decsTable;
+  state.tables.achats  = achatsTable;
+  state.tables.decs    = decsTable;
   state.tables.details = detailsTable;
   state.cols.achats = A;
-  state.cols.decs = D;
-  state.cols.details = dateFallback || {};
+  state.cols.decs   = D;
+  state.cols.details= dateFallback || {};
   state.builtAt = new Date();
 
   const counts = await runSQL(`
@@ -394,17 +441,19 @@ Rends UNIQUEMENT le JSON demandé.`;
     tables: state.tables,
     cols: state.cols,
     counts,
-    builtAt: state.builtAt,
+    builtAt: state.builtAt
   };
 }
 
-// ---- Résumé pour le frontend (taxonomie + fournisseurs par sous-catégorie) ----
+/* =========================================================
+   Résumé pour frontend
+   ========================================================= */
 export async function getSummary() {
   if (!state.taxonomy?.length) {
     return { taxonomy: [], suppliers: [], byCategory: {}, bySubcategorySupplier: {}, counts: {} };
   }
   const taxo = state.taxonomy;
-  const byCategory = Object.fromEntries(taxo.map((t) => [t.category, t.subcategories]));
+  const byCategory = Object.fromEntries(taxo.map(t => [t.category, t.subcategories]));
 
   const suppliersRows = await runSQL(`
     SELECT DISTINCT subcategory, COALESCE(fournisseur,'') AS f
@@ -430,18 +479,20 @@ export async function getSummary() {
     FROM catalog_line_map
     GROUP BY 1;
   `);
-  const countMap = Object.fromEntries(counts.map((c) => [c.subcategory, Number(c.n)]));
+  const countMap = Object.fromEntries(counts.map(c => [c.subcategory, Number(c.n)]));
 
   return {
     taxonomy: taxo,
-    suppliers: suppliersAll.map((s) => s.fournisseur).filter(Boolean),
+    suppliers: suppliersAll.map(s => s.fournisseur).filter(Boolean),
     byCategory,
     bySubcategorySupplier: bySub,
     counts: countMap,
   };
 }
 
-// ---- Profil d'écoulement par (sous-catégorie, fournisseur) ----
+/* =========================================================
+   Profil d'écoulement
+   ========================================================= */
 export async function getProfile(subcategory, supplier) {
   if (!subcategory || !supplier) throw new Error("Paramètres requis: subcategory & supplier.");
 
@@ -485,8 +536,8 @@ export async function getProfile(subcategory, supplier) {
   const stats =
     (await runSQL(`
       SELECT
-        CAST(COUNT(*) AS INT) AS n_payments,
-        COALESCE(SUM(montant),0) AS total,
+        CAST(COUNT(*) AS INT)           AS n_payments,
+        COALESCE(SUM(montant),0)        AS total,
         CAST(quantile_cont(delay_days, 0.5) AS INT)  AS median_delay,
         CAST(quantile_cont(delay_days, 0.25) AS INT) AS p25,
         CAST(quantile_cont(delay_days, 0.75) AS INT) AS p75
