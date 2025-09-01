@@ -1,0 +1,19 @@
+{
+  "name": "procure-chat-ollama-server",
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "duckdb": "^1.1.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.56.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.8"
+  }
+}
