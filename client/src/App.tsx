@@ -17,6 +17,7 @@ import {
   FolderTree,
   Wand2,
   Building2,
+  Bug,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -26,37 +27,33 @@ import {
   XAxis,
   YAxis,
   Tooltip,
-  LineChart,
-  Line,
   Legend,
+  ReferenceLine,
 } from "recharts";
 
 /**
- * Procure Chat — Frontend Revamp + Catalogue de catégories & profils de décaissement
+ * Procure Chat — Frontend (complet)
  * - Onglets Chat / Catalogue
- * - Construction du catalogue (LLM) via /catalog/build
- * - Sélection Catégorie > Sous-catégorie > Fournisseur
- * - Graphique des paiements (montant par délai en jours) + stats
- *
- * Dépendances supplémentaires (client/):
- *   npm i lucide-react recharts
+ * - Upload Excel + Schéma
+ * - Chat analytique (LLM => SQL)
+ * - Catalogue: build, sélection Cat/SC/Fournisseur
+ * - Profil: bar chart + quartiles + panneau debug
+ * - Export/Import JSON du catalogue
  */
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8787";
+const API = (import.meta as any).env?.VITE_API_URL || "http://localhost:8787";
 
 type ChatItem = { role: "user" | "assistant"; content: string };
 type Row = Record<string, any>;
-
 type Health = { ok?: boolean; model?: string };
-
 type TaxoNode = { category: string; subcategories: string[] };
 
 type CatalogSummary = {
   taxonomy: TaxoNode[];
   suppliers: string[];
-  byCategory: Record<string, string[]>; // category -> subcategories
-  bySubcategorySupplier: Record<string, string[]>; // subcategory -> suppliers
-  counts?: Record<string, number>; // optional usage counts per subcategory
+  byCategory: Record<string, string[]>;
+  bySubcategorySupplier: Record<string, string[]>;
+  counts?: Record<string, number>;
 };
 
 type ProfileResp = {
@@ -64,9 +61,12 @@ type ProfileResp = {
   series: { delay_days: number; montant_total: number }[];
   cumulative: { delay_days: number; cum_amount: number; share: number }[];
   stats: { n_payments: number; total: number; median_delay: number; p25: number; p75: number };
-  // --- ajouts minimaux :
   quartiles?: Record<string, { delay_days: number; cum_amount: number }>;
-  debugPoints?: { delay_days: number; montant: number; payment_date: string; order_no: string; line_no: string }[];
+  debug?: {
+    totalPaymentsAll: number;
+    totalPaymentsWithDelay: number;
+    sampleSeriesHead: { delay_days: number; montant_total: number }[];
+  };
 };
 
 function Badge({ color = "#e5e7eb", text }: { color?: string; text: string }) {
@@ -121,31 +121,31 @@ export default function App() {
   const [sup, setSup] = useState<string>("");
   const [profile, setProfile] = useState<ProfileResp | null>(null);
 
+  // Import JSON ref (⚠️ une seule déclaration)
+  const jsonRef = useRef<HTMLInputElement>(null);
+
+  // ----------------- Health + schema + summary init -----------------
   async function refreshSchema() {
     const r = await fetch(`${API}/schema`);
     const j = await r.json();
     setSchema(j.tables || {});
   }
-
   async function getHealth() {
     try {
       const r = await fetch(`${API}/health`);
       const j = await r.json();
       setHealth(j);
-    } catch (e) {
+    } catch {
       setHealth({ ok: false });
     }
   }
-
   useEffect(() => {
     getHealth();
     refreshSchema();
     fetchSummary();
   }, []);
 
-  // -----------------
-  // CHAT
-  // -----------------
+  // ----------------- CHAT -----------------
   async function onSend() {
     if (!input.trim() || loadingChat) return;
     const question = input.trim();
@@ -182,7 +182,6 @@ export default function App() {
     const files = Array.from(e.dataTransfer.files || []).filter((f) => /\.xlsx?$/i.test(f.name));
     if (files.length) handleUpload(files);
   }
-
   function onFilesPicked(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
     if (files.length) handleUpload(files);
@@ -239,9 +238,7 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
-  // -----------------
-  // CATALOGUE
-  // -----------------
+  // ----------------- CATALOGUE -----------------
   async function buildCatalog() {
     setBuilding(true);
     try {
@@ -262,12 +259,12 @@ export default function App() {
       const j: CatalogSummary = await r.json();
       if ((j as any).error) throw new Error((j as any).error);
       setSummary(j);
-      // reset selections if obsolete
+      // reset selections si obsolètes
       if (j && cat && !(j.byCategory[cat]?.length)) {
         setCat(""); setSub(""); setSup("");
       }
-    } catch (e) {
-      // ignore silently if not built yet
+    } catch {
+      // pas encore construit : ignorer
     }
   }
 
@@ -277,26 +274,36 @@ export default function App() {
     const r = await fetch(`${API}/catalog/profile?${q.toString()}`);
     const j: any = await r.json();
     if (j.error) { alert(j.error); return; }
-    // --- logs debug minimaux demandés :
-    if (j.debugPoints) console.log("DEBUG profile.debugPoints:", j.debugPoints);
-    if (j.cumulative) console.log("DEBUG profile.cumulative:", j.cumulative);
+
+    // Debug client
+    try {
+      console.log("[catalog/profile] stats:", j.stats);
+      console.log("[catalog/profile] series.len:", Array.isArray(j.series) ? j.series.length : 0);
+      if (Array.isArray(j.series) && !j.series.length) {
+        console.log("[catalog/profile] series empty -> check order_date / delay_days on server");
+      }
+      if (j.quartiles) console.log("[catalog/profile] quartiles:", j.quartiles);
+      if (j.debug) console.log("[catalog/profile] debug:", j.debug);
+    } catch {}
+
     setProfile(j as ProfileResp);
   }
 
   useEffect(() => {
     if (sub && sup) fetchProfile();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sub, sup]);
 
   const subcats = useMemo(() => (cat && summary ? summary.byCategory[cat] || [] : []), [cat, summary]);
   const suppliers = useMemo(() => (sub && summary ? summary.bySubcategorySupplier[sub] || [] : []), [sub, summary]);
 
-  // --- AJOUTS MINIMAUX: Export / Import JSON ---
+  // Export / Import JSON du catalogue (⚠️ jsonRef déjà déclaré plus haut)
   async function exportCatalogJSON() {
     try {
-      const res = await fetch(`${API}/catalog/export`);
-      const data = await res.json();
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const r = await fetch(`${API}/catalog/export`);
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      const blob = new Blob([JSON.stringify(j, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -308,23 +315,24 @@ export default function App() {
     }
   }
 
-  async function importCatalogJSON(file?: File | null) {
-    if (!file) return;
+  async function importCatalogJSON(file: File) {
     try {
       const text = await file.text();
-      const json = JSON.parse(text);
-      await fetch(`${API}/catalog/import`, {
+      const payload = JSON.parse(text);
+      const r = await fetch(`${API}/catalog/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(json),
+        body: JSON.stringify(payload),
       });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
       await fetchSummary();
-      alert("Catalogue importé");
+      if (sub && sup) await fetchProfile();
+      alert("Catalogue importé.");
     } catch (e: any) {
       alert(e?.message || String(e));
     }
   }
-  const importRef = useRef<HTMLInputElement>(null);
 
   return (
     <div
@@ -531,26 +539,26 @@ export default function App() {
                 <FolderTree />
                 <div style={{ fontWeight: 700 }}>Catalogue de catégories</div>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-                  {/* --- boutons ajoutés (export/import) --- */}
-                  <button
-                    onClick={exportCatalogJSON}
-                    style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}
-                    title="Exporter le catalogue en JSON"
-                  >
-                    <Download size={16} /> Exporter
-                  </button>
-                  <button
-                    onClick={() => importRef.current?.click()}
-                    style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}
-                    title="Importer un catalogue JSON"
-                  >
-                    <UploadCloud size={16} /> Importer
-                  </button>
-                  <input ref={importRef} type="file" accept="application/json" onChange={(e) => importCatalogJSON(e.target.files?.[0] || null)} style={{ display: "none" }} />
-                  {/* --- bouton existant build --- */}
                   <button onClick={buildCatalog} disabled={building} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: building ? "#94a3b8" : "#111827", color: "#fff", border: 0, borderRadius: 10, padding: "10px 14px", cursor: building ? "not-allowed" : "pointer" }}>
                     <Wand2 size={16} /> {building ? "Construction…" : "Construire / Mettre à jour"}
                   </button>
+                  <button onClick={exportCatalogJSON} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}>
+                    <Download size={16} /> Exporter JSON
+                  </button>
+                  <button onClick={() => jsonRef.current?.click()} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}>
+                    <UploadCloud size={16} /> Importer JSON
+                  </button>
+                  <input
+                    ref={jsonRef}
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) importCatalogJSON(f);
+                      if (jsonRef.current) jsonRef.current.value = "";
+                    }}
+                    style={{ display: "none" }}
+                  />
                 </div>
               </div>
               <div style={{ marginTop: 10, fontSize: 13, color: "#475569" }}>
@@ -573,7 +581,7 @@ export default function App() {
                   <label style={{ fontWeight: 700 }}>Sous-catégorie</label>
                   <select value={sub} onChange={(e) => { setSub(e.target.value); setSup(""); }} style={{ padding: 10, border: "1px solid #e5e7eb", borderRadius: 10 }}>
                     <option value="">— choisir —</option>
-                    {subcats.map((s) => (
+                    {(cat && summary ? summary.byCategory[cat] || [] : []).map((s) => (
                       <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
@@ -581,7 +589,7 @@ export default function App() {
                   <label style={{ fontWeight: 700 }}>Fournisseur</label>
                   <select value={sup} onChange={(e) => setSup(e.target.value)} style={{ padding: 10, border: "1px solid #e5e7eb", borderRadius: 10 }}>
                     <option value="">— choisir —</option>
-                    {suppliers.map((s) => (
+                    {(sub && summary ? summary.bySubcategorySupplier[sub] || [] : []).map((s) => (
                       <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
@@ -624,6 +632,7 @@ export default function App() {
                     <div>Total: <b>{profile.stats.total.toLocaleString()}</b></div>
                     <div>Md: <b>{profile.stats.median_delay} j</b></div>
                     <div>P25/P75: <b>{profile.stats.p25} / {profile.stats.p75} j</b></div>
+                    {profile.quartiles?.["1.0"] && <div>100%: <b>{profile.quartiles["1.0"].delay_days} j</b></div>}
                   </div>
                 )}
               </div>
@@ -645,19 +654,68 @@ export default function App() {
                         <Tooltip />
                         <Legend />
                         <Bar dataKey="montant_total" name="Montant par délai" />
+
+                        {/* Repères quartiles */}
+                        {profile?.quartiles?.["0.25"] && (
+                          <ReferenceLine
+                            x={profile.quartiles["0.25"].delay_days}
+                            strokeDasharray="4 2"
+                            label={{ value: "P25", position: "top" }}
+                          />
+                        )}
+                        {profile?.quartiles?.["0.5"] && (
+                          <ReferenceLine
+                            x={profile.quartiles["0.5"].delay_days}
+                            strokeDasharray="4 2"
+                            label={{ value: "Med", position: "top" }}
+                          />
+                        )}
+                        {profile?.quartiles?.["0.75"] && (
+                          <ReferenceLine
+                            x={profile.quartiles["0.75"].delay_days}
+                            strokeDasharray="4 2"
+                            label={{ value: "P75", position: "top" }}
+                          />
+                        )}
+                        {profile?.quartiles?.["1.0"] && (
+                          <ReferenceLine
+                            x={profile.quartiles["1.0"].delay_days}
+                            strokeDasharray="4 2"
+                            label={{ value: "100%", position: "top" }}
+                          />
+                        )}
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
 
-                  {/* --- AJOUT minimal : bloc quartiles --- */}
-                  {profile.quartiles && (
-                    <div style={{ marginTop: 12 }}>
-                      <div style={{ fontWeight: 700, marginBottom: 6 }}>Quartiles d'écoulement</div>
-                      <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 12 }}>
-                        <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{JSON.stringify(profile.quartiles, null, 2)}</pre>
-                      </div>
+                  {/* DEBUG PANEL */}
+                  <div style={{ marginTop: 12, background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, color: "#334155", fontWeight: 600 }}>
+                      <Bug size={16} /> Debug profil
                     </div>
-                  )}
+                    <div style={{ fontSize: 13, color: "#334155", display: "grid", gap: 6 }}>
+                      <div>
+                        Séries (bars): <b>{profile.series?.length || 0}</b> | Paiements (delay != NULL): <b>{(profile.debug?.totalPaymentsWithDelay ?? (profile.series?.length || 0))}</b>
+
+                      </div>
+                      {profile.debug?.sampleSeriesHead?.length ? (
+                        <div>
+                          Exemples: {profile.debug.sampleSeriesHead.map((r, i) => (
+                            <span key={i} style={{ marginRight: 8 }}>{`(d=${r.delay_days}, m=${r.montant_total})`}</span>
+                          ))}
+                        </div>
+                      ) : (
+                        <div>Aucun exemple (probable: tous les <i>delay_days</i> sont NULL — vérifier la date de commande côté source).</div>
+                      )}
+                      {profile.quartiles && (
+                        <div>
+                          Quartiles: {Object.entries(profile.quartiles).map(([k, v]) => (
+                            <span key={k} style={{ marginRight: 12 }}>{k}: <b>{v.delay_days} j</b> (cum={v.cum_amount})</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </>
               )}
             </section>

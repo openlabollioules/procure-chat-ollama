@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { getSchema, runSQL } from "./db.js";
 
 /* =========================================================
-   Intitulés & alias
+   Intitulés & alias (élargis)
    ========================================================= */
 const COLUMN_ALIASES = {
   achats: {
@@ -88,7 +88,7 @@ const normAlnum = (expr) => `
 `;
 const normNum = (expr) => `
   NULLIF( regexp_replace(regexp_replace(CAST(${expr} AS VARCHAR), '[0-9]+', '\\0', 'g'), '^0+', '', 'g'), '' )
-`.replace("'\\0'", "'\\0'"); // (no-op, keep for clarity)
+`.replace("'\\0'", "'\\0'"); // (no-op)
 
 /* ---------- Dates robustes ---------- */
 function sqlDateFromAny(expr) {
@@ -106,32 +106,9 @@ function sqlDateFromAny(expr) {
 
 /* ---------- SELECT dynamiques ---------- */
 const selOrNull = (col, alias) => col ? `"${esc(col)}" AS ${alias}` : `NULL AS ${alias}`;
-const condIsNotNull = (col) => col ? `"${esc(col)}" IS NOT NULL` : `FALSE`;
 
 /* =========================================================
-   Introspection DuckDB (fallback quand getSchema() est vide)
-   ========================================================= */
-async function introspectSchemaDuckDB() {
-  const tables = await runSQL(`
-    SELECT table_name
-    FROM information_schema.tables
-    WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
-    ORDER BY table_name;
-  `);
-  const out = {};
-  for (const t of tables) {
-    const name = t.table_name;
-    const cols = await runSQL(`PRAGMA table_info('${String(name).replace(/'/g,"''")}');`);
-    out[name] = cols.map(c => ({
-      name: c.name,
-      original: c.name,
-    }));
-  }
-  return out;
-}
-
-/* =========================================================
-   Détection robuste des rôles de table (Achats / Décaissements / Détails)
+   Détection des tables par signature
    ========================================================= */
 function scoreTableForRole(schema, table, roleAliases) {
   const neededGroups = Object.entries(roleAliases)
@@ -183,16 +160,10 @@ function pickTablesBySignature(schema) {
 }
 
 /* =========================================================
-   Build: classification incrémentale + paiements
+   Build: classification + paiements
    ========================================================= */
 export async function buildCatalog() {
-  // Schéma + fallback
-  let schema = getSchema();
-  if (!schema || !Object.keys(schema).length) {
-    schema = await introspectSchemaDuckDB();
-  }
-
-  // 1) Trouver les tables par signature (évite les mélanges)
+  const schema = getSchema() || {};
   const picked = pickTablesBySignature(schema);
 
   const achatsTable  = picked.achats.table;
@@ -216,7 +187,7 @@ export async function buildCatalog() {
     date_pay:  picked.decs.cols.date_pay  || resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.date_pay),
   };
 
-  // Détails (facultatif) pour fallback date
+  // Fallback éventuel pour la date de commande via table "détails"
   let dateFallback = null;
   if (detailsTable) {
     const detOrder = picked.details.cols.order_no  || resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.order_no);
@@ -227,13 +198,12 @@ export async function buildCatalog() {
     }
   }
 
-  // Vérifs min : uniquement les clés Achats + décaissements requis
   if (!A.order_no || !A.line_no) throw new Error("Colonnes clés manquantes dans Achats (N° commande / N° ligne).");
   if (!D.order_no || !D.line_no || !D.montant || !D.date_pay) {
     throw new Error("Colonnes clés manquantes dans Décaissements (commande/ligne + montant + date paiement).");
   }
 
-  // Champs textuels ? (au moins un)
+  // Au moins un champ descriptif pour le LLM
   const hasAnyTextField = Boolean(A.type_ligne || A.desc_cmd || A.desc_line);
   if (!hasAnyTextField) {
     throw new Error(
@@ -242,7 +212,7 @@ export async function buildCatalog() {
     );
   }
 
-  // Table mapping lignes -> catégories (reconstruite)
+  // Table de mapping (recréée)
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_line_map (
       order_no VARCHAR,
@@ -254,7 +224,7 @@ export async function buildCatalog() {
   `);
   await runSQL(`DELETE FROM catalog_line_map;`);
 
-  // Charger toutes les lignes Achats
+  // Lignes Achats à classifier
   const lines = await runSQL(`
     SELECT
       CAST("${esc(A.order_no)}" AS VARCHAR) AS order_no,
@@ -266,7 +236,7 @@ export async function buildCatalog() {
     FROM "${esc(achatsTable)}";
   `);
 
-  // Classification INCRÉMENTALE
+  // Classification incrémentale via LLM
   let canon = /** @type {{category:string, subcategories:string[]}[]} */ ([]);
   const batchSize = 120;
 
@@ -450,7 +420,7 @@ FORMAT JSON STRICT attendu:
          );
   `);
 
-  // État (canon = uniquement ce qui est utilisé)
+  // État (canon)
   const used = await runSQL(`SELECT DISTINCT category, subcategory FROM catalog_line_map ORDER BY 1,2;`);
   const byCat = new Map();
   for (const r of used) {
@@ -476,6 +446,10 @@ FORMAT JSON STRICT attendu:
     GROUP BY 1
     ORDER BY n DESC;
   `);
+
+  // Debug: combien de paiements calculés ?
+  const payCount = await runSQL(`SELECT COUNT(*) AS n FROM catalog_payments;`);
+  console.log("[buildCatalog] catalog_payments rows:", payCount?.[0]?.n ?? 0);
 
   return {
     taxonomy: state.taxonomy,
@@ -537,11 +511,19 @@ export async function getSummary() {
 export async function getProfile(subcategory, supplier) {
   if (!subcategory || !supplier) throw new Error("Paramètres requis: subcategory & supplier.");
 
+  // Debug: état de la table payments pour ce profil
+  const dbgCountAll = await runSQL(`
+    SELECT COUNT(*) AS n FROM catalog_payments
+    WHERE subcategory = ${q(subcategory)} AND fournisseur = ${q(supplier)};
+  `);
+
+  // On exclut explicitement les delay_days NULL du graphique et des stats
   const series = await runSQL(`
     SELECT delay_days, SUM(montant) AS montant_total
     FROM catalog_payments
     WHERE subcategory = ${q(subcategory)}
       AND fournisseur = ${q(supplier)}
+      AND delay_days IS NOT NULL
     GROUP BY 1
     ORDER BY 1;
   `);
@@ -551,29 +533,35 @@ export async function getProfile(subcategory, supplier) {
     FROM catalog_payments
     WHERE subcategory = ${q(subcategory)}
       AND fournisseur = ${q(supplier)}
+      AND delay_days IS NOT NULL
     ORDER BY payment_date;
   `);
 
-  const totRow = await runSQL(`
+  // cumul pour déterminer les seuils (quartiles)
+  const totalRow = await runSQL(`
     SELECT COALESCE(SUM(montant),0) AS s
     FROM catalog_payments
     WHERE subcategory = ${q(subcategory)}
-      AND fournisseur = ${q(supplier)};
+      AND fournisseur = ${q(supplier)}
+      AND delay_days IS NOT NULL;
   `);
-  const total = Number((totRow && totRow.length ? totRow[0].s : 0) || 0);
+  const total = Number((totalRow && totalRow.length ? totalRow[0].s : 0) || 0);
 
   const cumulative = [];
   let acc = 0;
   for (const r of series) {
     const amt = Number(r.montant_total || 0);
+    const d = r.delay_days != null ? Number(r.delay_days) : null;
+    if (d == null) continue;
     acc += amt;
     cumulative.push({
-      delay_days: r.delay_days,
+      delay_days: d,
       cum_amount: acc,
       share: total ? acc / total : 0,
     });
   }
 
+  // Stats robustes (quantiles sur delay_days non nuls)
   const statsRows = await runSQL(`
     SELECT
       CAST(COUNT(*) AS INT)                AS n_payments,
@@ -583,7 +571,8 @@ export async function getProfile(subcategory, supplier) {
       CAST(quantile_cont(delay_days, 0.75) AS INT) AS p75
     FROM catalog_payments
     WHERE subcategory = ${q(subcategory)}
-      AND fournisseur = ${q(supplier)};
+      AND fournisseur = ${q(supplier)}
+      AND delay_days IS NOT NULL;
   `);
   const stats = (statsRows && statsRows.length)
     ? statsRows[0]
@@ -594,14 +583,37 @@ export async function getProfile(subcategory, supplier) {
   const thresholds = [0.25, 0.5, 0.75, 1.0];
   for (const t of thresholds) {
     const qpoint = cumulative.find(c => c.share >= t);
-    if (qpoint) quartiles[t] = { delay_days: qpoint.delay_days, cum_amount: qpoint.cum_amount };
+    if (qpoint) quartiles[t.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')] = {
+      delay_days: Number(qpoint.delay_days),
+      cum_amount: Number(qpoint.cum_amount)
+    };
   }
 
+  // Debug serveurs (console) + payload "debug" pour le front
+  console.log(`[getProfile] sub=${subcategory} | supplier=${supplier} | rows(all)=${dbgCountAll?.[0]?.n ?? 0} | rows(series)=${series.length}`);
+  if (series.length) {
+    const head = series.slice(0, 5).map(r => ({ d: r.delay_days, m: Number(r.montant_total || 0) }));
+    console.log("[getProfile] head(series):", head);
+  } else {
+    console.log("[getProfile] series is empty (no delay_days != NULL). Check order_date availability during build.");
+  }
+  console.log("[getProfile] quartiles:", quartiles);
+
   return {
-    series,
-    points,
+    series: series.map(r => ({ delay_days: Number(r.delay_days), montant_total: Number(r.montant_total || 0) })),
+    points: points.map(p => ({
+      delay_days: Number(p.delay_days),
+      montant: Number(p.montant || 0),
+      payment_date: String(p.payment_date || ""),
+      order_no: String(p.order_no || ""),
+      line_no: String(p.line_no || "")
+    })),
     cumulative,
-    debugPoints: points, // debug complet pour le front
+    debug: {
+      totalPaymentsAll: Number(dbgCountAll?.[0]?.n || 0),
+      totalPaymentsWithDelay: series.reduce((n, _r) => n + 1, 0),
+      sampleSeriesHead: series.slice(0, 5).map(r => ({ delay_days: r.delay_days, montant_total: Number(r.montant_total || 0) })),
+    },
     stats: {
       n_payments: Number(stats.n_payments || 0),
       total: Number(stats.total || 0),
@@ -627,6 +639,32 @@ export async function exportCatalog() {
 
 export async function importCatalog(data) {
   if (!data || !Array.isArray(data.taxonomy)) throw new Error("Catalogue invalide");
+
+  // Assurer l’existence des tables requises
+  await runSQL(`
+    CREATE TABLE IF NOT EXISTS catalog_line_map (
+      order_no VARCHAR,
+      line_no VARCHAR,
+      category VARCHAR,
+      subcategory VARCHAR,
+      fournisseur VARCHAR
+    );
+  `);
+
+  await runSQL(`
+    CREATE TABLE IF NOT EXISTS catalog_payments (
+      category VARCHAR,
+      subcategory VARCHAR,
+      fournisseur VARCHAR,
+      order_no VARCHAR,
+      line_no VARCHAR,
+      order_date DATE,
+      payment_date DATE,
+      montant DOUBLE,
+      delay_days INTEGER
+    );
+  `);
+
   state.taxonomy = data.taxonomy;
   state.builtAt = new Date();
 

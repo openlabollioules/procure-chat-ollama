@@ -1,204 +1,149 @@
 // server/src/index.js
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import multer from "multer";
-import * as XLSX from "xlsx";
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
 
-import { getSchema, runSQL } from "./db.js";
-import {
-  buildCatalog,
-  getSummary,
-  getProfile,
-  exportCatalog,
-  importCatalog
-} from "./catalog.js";
+import { getSchema, safeRun, ingestXlsxBuffer } from './db.js';
+import { suggestSQL } from './llm.js';
+import * as catalog from './catalog.js';
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer();
 
+// Middlewares
 app.use(cors());
-app.use(bodyParser.json({ limit: "25mb" }));
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
 
 /* ---------------- Health ---------------- */
-app.get("/health", async (req, res) => {
+app.get('/health', async (_req, res) => {
+  res.json({
+    ok: true,
+    model: process.env.OLLAMA_MODEL || 'gpt-oss:20b',
+  });
+});
+
+/* ---------------- Schéma (tel que tenu par db.js) ---------------- */
+app.get('/schema', async (_req, res) => {
   try {
-    res.json({
-      ok: true,
-      model: process.env.OLLAMA_MODEL || "gpt-oss:20b",
-    });
+    const schema = getSchema();
+    res.json({ tables: schema || {} });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-/* ---------------- Schema (avec fallback introspection) ---------------- */
-app.get("/schema", async (req, res) => {
+/* ---------------- Upload XLSX -> DuckDB (via db.js) ----------------
+   form-data:
+     - file: <xlsx>
+     - table: <nom_souhaité> (optionnel)
+-------------------------------------------------------------------- */
+app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    let schema = getSchema();
-    if (!schema || !Object.keys(schema).length) {
-      // Fallback: introspection directe dans DuckDB
-      const tables = await runSQL(`
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
-        ORDER BY table_name;
-      `);
-      const out = {};
-      for (const t of tables) {
-        const name = t.table_name;
-        const cols = await runSQL(`PRAGMA table_info('${String(name).replace(/'/g,"''")}');`);
-        out[name] = cols.map(c => ({ name: c.name, original: c.name }));
-      }
-      return res.json({ tables: out });
-    }
-    res.json({ tables: schema });
+    if (!req.file) return res.status(400).json({ error: 'Aucun fichier' });
+    const tableNameHint = String(req.body.table || req.file.originalname || 'table')
+      .replace(/\.(xlsx|xls)$/i, '');
+    const out = await ingestXlsxBuffer(req.file.buffer, { tableNameHint });
+    res.json(out);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    console.error(e);
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-/* ---------------- Upload XLSX -> DuckDB ----------------
-   Front envoie:
-     POST /upload
-       form-data: file=<xlsx>, table=<nom_souhaité>
-   Réponse JSON (succès):
-     { table: "<nom_table>", rows: <n>, columns: ["col1", ...] }
--------------------------------------------------------- */
-app.post("/upload", upload.single("file"), async (req, res) => {
+/* ---------------- Chat analytique : LLM -> SQL -> DuckDB ----------------
+   - Le LLM (Ollama API OpenAI-compatible) génère une requête SQL DuckDB (SELECT…)
+   - On exécute la requête avec safeRun (bloque DDL/DML)
+------------------------------------------------------------------------ */
+app.post('/chat', async (req, res) => {
   try {
-    if (!req.file?.buffer) throw new Error("Fichier manquant.");
-    const tableRaw = (req.body?.table || req.file.originalname || "xlsx")
-      .replace(/\.[^.]+$/, "");
-    const table = tableRaw.replace(/[^A-Za-z0-9_]+/g, "_").replace(/^(\d)/, "_$1");
+    const question = String(req.body?.message || '').trim();
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
 
-    // lecture xlsx en mémoire
-    const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheetName = wb.SheetNames?.[0];
-    if (!sheetName) throw new Error("Feuille Excel introuvable.");
-    const ws = wb.Sheets[sheetName];
+    // Schéma courant tenu par db.js (tables/colonnes/types)
+    const schema = getSchema() || {};
 
-    // JSON souple (toutes colonnes VARCHAR)
-    const json = XLSX.utils.sheet_to_json(ws, { defval: null });
-    if (!json.length) {
-      await runSQL(`CREATE OR REPLACE TABLE "${table}" (col VARCHAR);`);
-      return res.json({ table, rows: 0, columns: ["col"] });
-    }
+    // 1) Demande au LLM une requête SQL DuckDB SÉLECT uniquement
+    const sql = await suggestSQL({ schema, question, history });
 
-    // Colonnes
-    const columns = Array.from(
-      json.reduce((acc, row) => {
-        Object.keys(row).forEach(k => acc.add(String(k)));
-        return acc;
-      }, new Set())
-    );
+    // 2) Exécution sécurisée (refuse CREATE/INSERT/UPDATE/DELETE/…)
+    const rows = await safeRun(sql);
 
-    // Créer table
-    const colsDDL = columns
-      .map(c => `"${String(c).replace(/"/g, '""')}" VARCHAR`)
-      .join(", ");
-    await runSQL(`CREATE OR REPLACE TABLE "${table}" (${colsDDL});`);
-
-    // Insertions (batch)
-    const chunks = 100;
-    for (let i = 0; i < json.length; i += chunks) {
-      const part = json.slice(i, i + chunks);
-      const valuesSQL = part
-        .map(row => {
-          const vals = columns.map(c => {
-            const v = row?.[c];
-            if (v === null || v === undefined) return "NULL";
-            return `'${String(v).replace(/'/g, "''")}'`;
-          });
-          return `(${vals.join(",")})`;
-        })
-        .join(",\n");
-      await runSQL(`INSERT INTO "${table}" (${columns.map(c => `"${c.replace(/"/g, '""')}"`).join(",")}) VALUES ${valuesSQL};`);
-    }
-
-    res.json({ table, rows: json.length, columns });
+    res.json({ sql, rows });
   } catch (e) {
-    console.error("[/upload] error:", e);
-    res.status(500).json({ error: String(e) });
+    console.error('[/chat] error:', e);
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 /* ---------------- Catalogue ---------------- */
-app.post("/catalog/build", async (req, res) => {
+app.post('/catalog/build', async (_req, res) => {
   try {
-    const out = await buildCatalog();
+    const out = await catalog.buildCatalog();
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-app.get("/catalog/summary", async (req, res) => {
+app.get('/catalog/summary', async (_req, res) => {
   try {
-    const out = await getSummary();
+    const out = await catalog.getSummary();
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-app.get("/catalog/profile", async (req, res) => {
+app.get('/catalog/profile', async (req, res) => {
   try {
-    const subcategory = req.query.subcategory;
-    const supplier = req.query.supplier;
-    const out = await getProfile(subcategory, supplier);
+    const { subcategory, supplier } = req.query;
+    if (!subcategory || !supplier) {
+      return res.status(400).json({ error: 'Paramètres requis: subcategory & supplier' });
+    }
+    const out = await catalog.getProfile(String(subcategory), String(supplier));
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-app.get("/catalog/export", async (req, res) => {
+app.get('/catalog/export', async (_req, res) => {
   try {
-    const out = await exportCatalog();
+    const out = await catalog.exportCatalog();
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-app.post("/catalog/import", async (req, res) => {
+app.post('/catalog/import', async (req, res) => {
   try {
-    const out = await importCatalog(req.body);
+    const out = await catalog.importCatalog(req.body);
     res.json(out);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-/* ---------------- Chat (optionnel) ---------------- */
-app.post("/chat", async (req, res) => {
-  try {
-    // À brancher à ta logique existante si besoin
-    res.json({ message: "Chat backend non implémenté ici." });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-/* ---------------- 404 JSON par défaut ---------------- */
+/* ---------------- 404 JSON ---------------- */
 app.use((req, res) => {
   res.status(404).json({ error: `Route non trouvée: ${req.method} ${req.originalUrl}` });
 });
 
 /* ---------------- Error handler JSON ---------------- */
-app.use((err, req, res, next) => {
-  console.error("[Unhandled]", err);
+app.use((err, _req, res, _next) => {
+  console.error('[Unhandled]', err);
   res.status(500).json({ error: String(err) });
 });
 
-const PORT = process.env.PORT || 8787;
+/* ---------------- Serveur ---------------- */
+const PORT = Number(process.env.PORT || 8787);
 app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);
 });
