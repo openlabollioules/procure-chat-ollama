@@ -3,64 +3,29 @@ import OpenAI from "openai";
 import { getSchema, runSQL } from "./db.js";
 
 /* =========================================================
-   Intitulés exacts (colonne A) des fichiers d'intitulés & samples
-   ---------------------------------------------------------
-   Vérifiés sur :
-   - Achat-samples.xlsx
-   - Décaissements depuis 2012-sample.xlsx
-   - Détails des lignes de Commandes-sample.xlsx
+   Intitulés & alias (élargis)
    ========================================================= */
 const COLUMN_ALIASES = {
   achats: {
-    order_no: [
-      "Nº de commande", "N° de commande", "N° Commande"
-    ],
-    line_no: [
-      "Nº de ligne de commande", "N° ligne commande", "N° Ligne Commande"
-    ],
-    type_ligne: [
-      "Type de la ligne de commande"
-    ],
-    desc_cmd: [
-      "Description de la commande"
-    ],
-    desc_line: [
-      "Description de la ligne", "Description Ligne"
-    ],
-    fourn: [
-      "Nom du fournisseur", "N° du fournisseur"
-    ],
-    date_cmd: [
-      "Date d'approbation", "Date de validation", "Date de création", "Date promise"
-    ]
+    order_no: ["Nº de commande","N° de commande","N° Commande","No Commande","Numero de commande","Numéro de commande","N° commande","Commande"],
+    line_no:  ["Nº de ligne de commande","N° ligne commande","N° Ligne Commande","No Ligne Commande","Ligne","N° ligne","N° Ligne","N° ligne de commande"],
+    type_ligne: ["Type de la ligne de commande","Type ligne","Type de ligne","Nature de ligne"], // optionnel
+    desc_cmd:   ["Description de la commande","Description commande","Description","Objet","Objet de la commande","Intitulé","Intitulé de la commande"], // optionnel
+    desc_line:  ["Description de la ligne","Description Ligne","Détail de ligne","Libellé de ligne"], // optionnel
+    fourn:      ["Nom du fournisseur","Fournisseur","Nom fournisseur","Raison sociale fournisseur","N° du fournisseur","Code fournisseur"], // optionnel
+    date_cmd:   ["Date d'approbation","Date de validation","Date de création","Date promise","Date commande","Date d'engagement"] // optionnel
   },
   decs: {
-    order_no: [
-      "N° Commande", "N° commande"
-    ],
-    line_no: [
-      "N° Ligne Commande", "N° ligne commande"
-    ],
-    date_pay: [
-      "Date règlement", "Date règlement "
-    ],
-    montant: [
-      "Montant règlement", "Montant réglé"
-    ]
+    order_no: ["N° Commande","N° commande","No Commande","Commande","Numero de commande"],
+    line_no:  ["N° Ligne Commande","N° ligne commande","No Ligne Commande","Ligne","N° ligne"],
+    date_pay: ["Date règlement","Date reglement","Date de règlement","Date de reglement","Date paiement","Date de paiement"],
+    montant:  ["Montant règlement","Montant reglement","Montant réglé","Montant payé","Montant paiement","Montant"]
   },
   details: {
-    order_no: [
-      "N° Commande", "N° commande"
-    ],
-    line_no: [
-      "N° Ligne Commande", "N° ligne commande"
-    ],
-    date_cmd_candidates: [
-      "Date engagement", "Date promesse", "Date estimée règlement"
-    ],
-    desc_line: [
-      "Description Ligne"
-    ]
+    order_no: ["N° Commande","N° commande","No Commande","Commande"],
+    line_no:  ["N° Ligne Commande","N° ligne commande","No Ligne Commande","Ligne"],
+    date_cmd_candidates: ["Date engagement","Date promesse","Date estimée règlement","Date estimée reglement","Date prévue règlement","Date prévue reglement","Date commande","Date de commande"],
+    desc_line: ["Description Ligne","Description de la ligne","Libellé de ligne","Détail de ligne"]
   }
 };
 
@@ -74,10 +39,10 @@ const client = new OpenAI({
 const MODEL = process.env.OLLAMA_MODEL || "gpt-oss:20b";
 
 /* =========================================================
-   État en mémoire
+   État
    ========================================================= */
 const state = {
-  taxonomy: /** @type {Array<{category:string, subcategories:string[]}>} */ ([]),
+  taxonomy: /** @type {Array<{category:string, subcategories:string[]}>} */ ([]), // canon final
   tables: { achats: null, decs: null, details: null },
   cols: { achats: {}, decs: {}, details: {} },
   builtAt: null,
@@ -86,185 +51,169 @@ const state = {
 /* =========================================================
    Helpers
    ========================================================= */
-function esc(id) { return id.replace(/"/g, '""'); }
-function q(v) {
-  if (v === null || v === undefined) return "NULL";
-  const s = String(v).replace(/'/g, "''");
-  return `'${s}'`;
-}
+function esc(id) { return String(id).replace(/"/g, '""'); }
+function q(v) { if (v==null) return "NULL"; return `'${String(v).replace(/'/g,"''")}'`; }
+const deaccent = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+const lowerDeaccent = (s) => deaccent(s).toLowerCase();
 
-// Choisit la meilleure table en fonction d'indices
-function findTable(schema, nameHints = [], requiredColsRegex = []) {
-  const tables = Object.keys(schema || {});
-  if (!tables.length) return null;
-  const scored = tables
-    .map((t) => {
-      const n = t.toLowerCase();
-      let score = 0;
-      for (const h of nameHints) if (n.includes(h)) score += 2;
-      const cols = schema[t] || [];
-      const names =
-        cols.map((c) => c.name).join("|") +
-        "|" +
-        cols.map((c) => String(c.original || "")).join("|");
-      for (const rx of requiredColsRegex) if (rx.test(names.toLowerCase())) score += 1;
-      return { t, score };
-    })
-    .sort((a, b) => b.score - a.score);
-  return (scored[0]?.score || 0) > 0 ? scored[0].t : tables[0];
-}
-
-// Cherche une colonne par libellé officiel (match exact sur "original" ou nom normalisé)
 function resolveByAliases(schema, table, aliases) {
   if (!table || !aliases?.length) return null;
   const cols = (schema[table] || []).map(c => ({
-    norm: (c.name || "").toLowerCase(),
-    orig: String(c.original || "").toLowerCase(),
+    norm: lowerDeaccent(c.name || ""),
+    orig: lowerDeaccent(String(c.original || "")),
     name: c.name
   }));
   for (const alias of aliases) {
-    const a = String(alias).toLowerCase();
-    const hit = cols.find(c => c.orig === a || c.norm === a);
+    const a = lowerDeaccent(alias);
+    let hit = cols.find(c => c.orig === a) || cols.find(c => c.norm === a)
+            || cols.find(c => c.orig.includes(a)) || cols.find(c => c.norm.includes(a));
     if (hit) return hit.name;
   }
   return null;
 }
 
-// Appel LLM et lecture JSON sécurisée (accepte ```json ...```)
 async function llmJSON(messages) {
-  const resp = await client.chat.completions.create({
-    model: MODEL,
-    messages,
-    temperature: 0.2,
-  });
+  const resp = await client.chat.completions.create({ model: MODEL, messages, temperature: 0.2 });
   let txt = resp.choices?.[0]?.message?.content?.trim() || "";
-  const m = txt.match(/```json\s*([\s\S]*?)```/i);
-  if (m) txt = m[1].trim();
-  try {
-    return JSON.parse(txt);
-  } catch {
-    throw new Error("Le LLM n'a pas renvoyé un JSON valide.");
-  }
+  const m = txt.match(/```json\s*([\s\S]*?)```/i); if (m) txt = m[1].trim();
+  return JSON.parse(txt);
 }
 
-// Normalise une clé (trim, upper, supprime espaces, supprime zéros de tête)
-const normKey = (expr) => `
-  NULLIF(
-    regexp_replace(
-      replace(upper(CAST(${expr} AS VARCHAR)), ' ', ''),
-      '^0+', ''
-    ),
-    ''
-  )
+/* ---------- Normalisation clés ---------- */
+const normAlnum = (expr) => `
+  NULLIF( regexp_replace(upper(CAST(${expr} AS VARCHAR)), '[^0-9A-Z]+', '', 'g'), '' )
+`;
+const normNum = (expr) => `
+  NULLIF( regexp_replace(regexp_replace(CAST(${expr} AS VARCHAR), '[^0-9]+', '', 'g'), '^0+', '', 'g'), '' )
 `;
 
-// Conversion robuste vers DATE (DATE/TIMESTAMP, strings FR/ISO, nombres Excel)
+/* ---------- Dates robustes ---------- */
 function sqlDateFromAny(expr) {
-    return `
-      COALESCE(
-        TRY_CAST(${expr} AS DATE),
-        CAST(TRY_CAST(${expr} AS TIMESTAMP) AS DATE),
-        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%Y-%m-%d') AS DATE),
-        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d/%m/%Y') AS DATE),
-        CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d-%m-%Y') AS DATE),
-        DATE '1899-12-30' + CAST(ROUND(CAST(${expr} AS DOUBLE)) AS INTEGER)
-      )
-    `;
-  }
-  
+  return `
+    COALESCE(
+      TRY_CAST(${expr} AS DATE),
+      CAST(TRY_CAST(${expr} AS TIMESTAMP) AS DATE),
+      CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%Y-%m-%d') AS DATE),
+      CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d/%m/%Y') AS DATE),
+      CAST(TRY_STRPTIME(CAST(${expr} AS VARCHAR), '%d-%m-%Y') AS DATE),
+      DATE '1899-12-30' + CAST(ROUND(CAST(${expr} AS DOUBLE)) AS INTEGER)
+    )
+  `;
+}
+
+/* ---------- SELECT dynamiques ---------- */
+const selOrNull = (col, alias) => col ? `"${esc(col)}" AS ${alias}` : `NULL AS ${alias}`;
+const condIsNotNull = (col) => col ? `"${esc(col)}" IS NOT NULL` : `FALSE`;
+
 /* =========================================================
-   Build: taxonomie + classification + paiements
+   Détection robuste des rôles de table (Achats / Décaissements / Détails)
+   ========================================================= */
+function scoreTableForRole(schema, table, roleAliases) {
+  const neededGroups = Object.entries(roleAliases)
+    .filter(([k]) => ["order_no","line_no","date_cmd","date_pay","montant","desc_cmd","desc_line","type_ligne"].includes(k));
+  let score = 0;
+  const found = {};
+  for (const [key, aliases] of neededGroups) {
+    const col = resolveByAliases(schema, table, aliases);
+    if (col) { score += 2; found[key] = col; }
+  }
+  if (found.montant) score += 2;
+  if (found.date_pay) score += 1;
+  if (found.desc_cmd || found.desc_line) score += 1;
+  return { score, found };
+}
+
+function pickTablesBySignature(schema) {
+  const tables = Object.keys(schema || {});
+  if (!tables.length) throw new Error("Aucune table en mémoire.");
+
+  const scored = tables.map(t => ({
+    t,
+    achats: scoreTableForRole(schema, t, COLUMN_ALIASES.achats),
+    decs:   scoreTableForRole(schema, t, COLUMN_ALIASES.decs),
+    details:scoreTableForRole(schema, t, COLUMN_ALIASES.details),
+  }));
+
+  const sortDesc = (arr, key) => arr.slice().sort((a,b)=>b[key].score - a[key].score);
+  const takeBest = (arr, key, used) => arr.find(x => !used.has(x.t) && x[key].score>0);
+
+  const used = new Set();
+  const sA = sortDesc(scored,"achats");   const bestA = takeBest(sA,"achats",used);   if (bestA) used.add(bestA.t);
+  const sD = sortDesc(scored,"decs");     const bestD = takeBest(sD,"decs",used);     if (bestD) used.add(bestD.t);
+  const sT = sortDesc(scored,"details");  const bestT = takeBest(sT,"details",used);  if (bestT) used.add(bestT.t);
+
+  const res = {
+    achats:  bestA ? { table: bestA.t, cols: bestA.achats.found, score: bestA.achats.score } : null,
+    decs:    bestD ? { table: bestD.t, cols: bestD.decs.found,   score: bestD.decs.score }   : null,
+    details: bestT ? { table: bestT.t, cols: bestT.details.found,score: bestT.details.score }: null,
+  };
+
+  const hasAchatsKeys = res.achats && res.achats.cols.order_no && res.achats.cols.line_no;
+  const hasDecsKeys   = res.decs   && res.decs.cols.order_no && res.decs.cols.line_no && res.decs.cols.montant && res.decs.cols.date_pay;
+
+  if (!hasAchatsKeys) throw new Error("Impossible d’identifier la table Achats (colonnes N° commande + N° ligne).");
+  if (!hasDecsKeys)   throw new Error("Impossible d’identifier la table Décaissements (commande/ligne + montant + date paiement).");
+
+  return res;
+}
+
+/* =========================================================
+   Build: classification incrémentale + paiements
    ========================================================= */
 export async function buildCatalog() {
   const schema = getSchema();
 
-  // 1) Tables
-  const achatsTable  = findTable(schema, ["achat","command"], [/type.*ligne/, /description.*commande/, /description.*ligne/]);
-  const decsTable    = findTable(schema, ["decaisse","regle","règle","paiem","reglement","règlement"], [/date.*(dec|reg|pai)/, /montant/]);
-  const detailsTable = findTable(schema, ["detail","ligne","lines"], [/n.*commande/, /ligne.*commande/]);
+  // 1) Trouver les tables par signature (évite les mélanges)
+  const picked = pickTablesBySignature(schema);
 
-  if (!achatsTable) throw new Error("Table Achats introuvable.");
-  if (!decsTable) throw new Error("Table Décaissements introuvable.");
+  const achatsTable  = picked.achats.table;
+  const decsTable    = picked.decs.table;
+  const detailsTable = picked.details?.table || null;
 
-  // 2) Colonnes Achats (intitulés exacts en priorité)
-  const A = {};
-  A.order_no   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.order_no);
-  A.line_no    = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.line_no);
-  A.type_ligne = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.type_ligne);
-  A.desc_cmd   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_cmd);
-  A.desc_line  = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_line);
-  A.fourn      = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.fourn);
-  A.date_cmd   = resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.date_cmd); // optionnelle
+  const A = {
+    order_no:  picked.achats.cols.order_no  || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.order_no),
+    line_no:   picked.achats.cols.line_no   || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.line_no),
+    type_ligne:resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.type_ligne),
+    desc_cmd:  picked.achats.cols.desc_cmd  || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_cmd),
+    desc_line: picked.achats.cols.desc_line || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.desc_line),
+    fourn:     picked.achats.cols.fourn     || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.fourn),
+    date_cmd:  picked.achats.cols.date_cmd  || resolveByAliases(schema, achatsTable, COLUMN_ALIASES.achats.date_cmd),
+  };
 
-  // 3) Colonnes Décaissements
-  const D = {};
-  D.order_no = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.order_no);
-  D.line_no  = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.line_no);
-  D.montant  = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.montant);
-  D.date_pay = resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.date_pay);
+  const D = {
+    order_no:  picked.decs.cols.order_no  || resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.order_no),
+    line_no:   picked.decs.cols.line_no   || resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.line_no),
+    montant:   picked.decs.cols.montant   || resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.montant),
+    date_pay:  picked.decs.cols.date_pay  || resolveByAliases(schema, decsTable, COLUMN_ALIASES.decs.date_pay),
+  };
 
-  // Vérifs minimales (sauf date_cmd)
-  const requiredA = ["order_no","line_no","type_ligne","desc_cmd","desc_line","fourn"];
-  for (const k of requiredA) if (!A[k]) throw new Error(`Colonne Achats manquante: ${k}`);
-  const requiredD = ["order_no","line_no","montant","date_pay"];
-  for (const k of requiredD) if (!D[k]) throw new Error(`Colonne Décaissements manquante: ${k}`);
-
-  // Fallback date via Détails si dispo
+  // Détails (facultatif) pour fallback date
   let dateFallback = null;
-  if (!A.date_cmd && detailsTable) {
-    const detOrder = resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.order_no);
-    const detLine  = resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.line_no);
-    const detDate  = resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.date_cmd_candidates);
+  if (detailsTable) {
+    const detOrder = picked.details.cols.order_no  || resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.order_no);
+    const detLine  = picked.details.cols.line_no   || resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.line_no);
+    const detDate  = picked.details.cols.date_cmd  || resolveByAliases(schema, detailsTable, COLUMN_ALIASES.details.date_cmd_candidates);
     if (detOrder && detLine && detDate) {
       dateFallback = { table: detailsTable, order_no: detOrder, line_no: detLine, col: detDate };
     }
   }
 
-  // 4) Échantillon Achats -> taxonomie via LLM
-  const sample = await runSQL(`
-    SELECT "${esc(A.type_ligne)}" AS type_ligne,
-           "${esc(A.desc_cmd)}"   AS desc_cmd,
-           "${esc(A.desc_line)}"  AS desc_line
-    FROM "${esc(achatsTable)}"
-    WHERE "${esc(A.type_ligne)}" IS NOT NULL
-       OR "${esc(A.desc_cmd)}"   IS NOT NULL
-       OR "${esc(A.desc_line)}"  IS NOT NULL
-    LIMIT 500;
-  `);
+  // 2) Vérifs min : uniquement les clés Achats + décaissements requis
+  if (!A.order_no || !A.line_no) throw new Error("Colonnes clés manquantes dans Achats (N° commande / N° ligne).");
+  if (!D.order_no || !D.line_no || !D.montant || !D.date_pay) {
+    throw new Error("Colonnes clés manquantes dans Décaissements (commande/ligne + montant + date paiement).");
+  }
 
-  const systemTaxo = `Tu es un classificateur d'achats en français.
-Produis UNIQUEMENT un JSON strict de la forme:
-{"taxonomy":[{"category":"<cat>", "subcategories":["<sub1>","<sub2>", ...]}, ...]}
-Règles:
-- Regroupe par natures métiers (ex: "Matériel informatique" > "Postes de travail", "Réseau", ...).
-- Pas de doublons, pas de texte superflu ni d'explications.
-- 15-30 catégories, chacune avec 3-15 sous-catégories, selon l'échantillon.`;
+  // 3) Préparer les lignes Achats (on ne dépend pas d’un champ textuel unique)
+  const hasAnyTextField = Boolean(A.type_ligne || A.desc_cmd || A.desc_line);
+  if (!hasAnyTextField) {
+    throw new Error(
+      `Impossible de construire le catalogue : aucune colonne descriptive trouvée dans '${achatsTable}'. ` +
+      `Ajoute au moins l'une de ces colonnes : Type de la ligne / Description de la commande / Description de la ligne.`
+    );
+  }
 
-  const userTaxo = `Voici un échantillon de lignes d'achats avec 3 champs:
-- Type de ligne de commande
-- Description de la commande
-- Description de la ligne
-
-Echantillon:
-${sample.map(r => `- [${r.type_ligne || ""}] ${r.desc_cmd || ""} | ${r.desc_line || ""}`).join("\n").slice(0, 8000)}
-
-Rends uniquement le JSON demandé.`;
-
-  const taxoJson = await llmJSON([
-    { role: "system", content: systemTaxo },
-    { role: "user", content: userTaxo },
-  ]);
-
-  const taxonomy = (taxoJson.taxonomy || [])
-    .map(t => ({
-      category: String(t.category || "").trim(),
-      subcategories: (t.subcategories || []).map(s => String(s || "").trim()).filter(Boolean),
-    }))
-    .filter(t => t.category && t.subcategories.length);
-
-  if (!taxonomy.length) throw new Error("Taxonomie vide renvoyée par le LLM.");
-
-  // 5) Classification des lignes Achats -> (category, subcategory)
+  // Table de mapping lignes -> catégories (sera reconstruite)
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_line_map (
       order_no VARCHAR,
@@ -276,20 +225,23 @@ Rends uniquement le JSON demandé.`;
   `);
   await runSQL(`DELETE FROM catalog_line_map;`);
 
+  // Charger toutes les lignes Achats
   const lines = await runSQL(`
     SELECT
       CAST("${esc(A.order_no)}" AS VARCHAR) AS order_no,
-      CAST("${esc(A.line_no)}" AS VARCHAR)  AS line_no,
-      "${esc(A.type_ligne)}"                AS type_ligne,
-      "${esc(A.desc_cmd)}"                  AS desc_cmd,
-      "${esc(A.desc_line)}"                 AS desc_line,
-      "${esc(A.fourn)}"                     AS fournisseur
+      CAST("${esc(A.line_no)}"  AS VARCHAR) AS line_no,
+      ${selOrNull(A.type_ligne, "type_ligne")},
+      ${selOrNull(A.desc_cmd,   "desc_cmd")},
+      ${selOrNull(A.desc_line,  "desc_line")},
+      ${selOrNull(A.fourn,      "fournisseur")}
     FROM "${esc(achatsTable)}";
   `);
 
-  const taxoText = JSON.stringify(taxonomy);
-  const batchSize = 120;
+  // 4) Classification INCRÉMENTALE
+  // La liste canonique se construit au fur et à mesure (initialement vide)
+  let canon = /** @type {{category:string, subcategories:string[]}[]} */ ([]);
 
+  const batchSize = 120;
   for (let i = 0; i < lines.length; i += batchSize) {
     const chunk = lines.slice(i, i + batchSize);
     const items = chunk.map(r => ({
@@ -300,45 +252,100 @@ Rends uniquement le JSON demandé.`;
       fournisseur: r.fournisseur || "",
     }));
 
-    const systemClass = `Tu classes des lignes d'achats en fonction d'une taxonomie fournie.
-Tu dois retourner pour chaque item un JSON: [{"key":"<order|||line>", "category":"<cat>", "subcategory":"<sub>"}...]
-Contraintes:
-- Utilise STRICTEMENT la taxonomie donnée (pas de nouvelles catégories).
-- Si ambigu, choisis la meilleure sous-catégorie.
-- Pas d'autre texte que le JSON.`;
+    const systemClass = `Tu construis un catalogue de catégories d'achats en français de manière incrémentale.
+RÈGLES IMPORTANTES:
+- Tu NE dois PAS inventer de catégories hors contexte : tu ne proposes que des catégories pertinentes pour les items fournis.
+- Tu peux réutiliser une catégorie/sous-catégorie existante si elle convient.
+- Tu peux créer une NOUVELLE catégorie/sous-catégorie si nécessaire, mais uniquement si elle est réellement justifiée par les items présents.
+- Si une nouvelle proposition est équivalente ou très proche d'une existante, utilise l'existante (et signale l'alias).
+- Réponds UNIQUEMENT en JSON.`;
 
-    const userClass = `Taxonomie:
-${taxoText}
+    const userClass = `Catalogue actuel (canonique):
+${JSON.stringify(canon)}
 
-Items à classer:
+Items à classifier (retourne un array "assignments"):
 ${JSON.stringify(items).slice(0, 12000)}
 
-Rends UNIQUEMENT le JSON demandé.`;
+FORMAT JSON STRICT attendu:
+{
+  "assignments": [
+    {"key":"<order|||line>","category":"<cat>","subcategory":"<sub>"} , ...
+  ],
+  "aliases": [
+    {"from":{"category":"X","subcategory":"Y"},"to":{"category":"X'","subcategory":"Y'"}}
+  ],
+  "new_categories": [
+    {"category":"<cat>","subcategories":["<sub1>","<sub2>", "..."]}
+  ]
+}
 
-    const res = await llmJSON([
-      { role: "system", content: systemClass },
-      { role: "user", content: userClass },
-    ]);
+Contraintes:
+- "assignments" doit couvrir TOUS les items donnés.
+- "aliases" est optionnel. Utilise-le seulement si tu estimes qu'une proposition devrait pointer vers une catégorie existante.
+- "new_categories" propose uniquement des catégories/sous-catégories utiles pour ces items.`;
 
-    const rowsToInsert = Array.isArray(res) ? res : res?.items;
-    if (!Array.isArray(rowsToInsert)) continue;
+    let out;
+    try {
+      out = await llmJSON([
+        { role: "system", content: systemClass },
+        { role: "user", content: userClass },
+      ]);
+    } catch {
+      // en cas d'erreur parsing, fallback trivial: tout ranger dans "Autre"
+      out = {
+        assignments: items.map(it => ({ key: it.key, category: "Autre", subcategory: "Autre" })),
+        aliases: [],
+        new_categories: []
+      };
+    }
 
-    for (const m of rowsToInsert) {
-      const [order_no, line_no] = String(m.key || "").split("|||");
-      const category   = String(m.category || "").trim();
-      const subcategory= String(m.subcategory || "").trim();
+    const assignments = Array.isArray(out?.assignments) ? out.assignments : [];
+    const aliases = Array.isArray(out?.aliases) ? out.aliases : [];
+    const newCats = Array.isArray(out?.new_categories) ? out.new_categories : [];
+
+    // Appliquer les alias (fusion de libellés vers canon)
+    for (const a of aliases) {
+      const fromC = (a?.from?.category || "").trim();
+      const fromS = (a?.from?.subcategory || "").trim();
+      const toC   = (a?.to?.category || "").trim();
+      const toS   = (a?.to?.subcategory || "").trim();
+      if (!fromC || !fromS || !toC || !toS) continue;
+      // Pas besoin de stocker une table de correspondance persistante : on s'assure que canon contient la cible
+      ensureInCanon(canon, toC, toS);
+      // Les assignments arrivant déjà "to" n'ont pas à être réécrits ici.
+    }
+
+    // Ajouter/actualiser le canon avec les nouvelles catégories proposées
+    for (const nc of newCats) {
+      const cat = String(nc?.category || "").trim();
+      const subs = (nc?.subcategories || []).map(s => String(s || "").trim()).filter(Boolean);
+      if (!cat || !subs.length) continue;
+      for (const sub of subs) ensureInCanon(canon, cat, sub);
+    }
+
+    // S'assurer que toutes les (cat, sub) des assignments sont dans le canon
+    for (const asg of assignments) {
+      const cat = String(asg?.category || "").trim();
+      const sub = String(asg?.subcategory || "").trim();
+      if (cat && sub) ensureInCanon(canon, cat, sub);
+    }
+
+    // Insérer les affectations en base
+    for (const asg of assignments) {
+      const [order_no, line_no] = String(asg.key || "").split("|||");
+      const category   = String(asg.category || "").trim();
+      const subcategory= String(asg.subcategory || "").trim();
       if (!order_no || !line_no || !category || !subcategory) continue;
-      const fournisseur = (chunk.find(r => `${r.order_no}|||${r.line_no}` === m.key)?.fournisseur) || "";
+      const fournisseur = (chunk.find(r => `${r.order_no}|||${r.line_no}` === asg.key)?.fournisseur) || "";
 
-      const insertSQL = `
+      await runSQL(`
         INSERT INTO catalog_line_map (order_no, line_no, category, subcategory, fournisseur)
         VALUES (${q(order_no)}, ${q(line_no)}, ${q(category)}, ${q(subcategory)}, ${q(fournisseur)});
-      `;
-      await runSQL(insertSQL);
+      `);
     }
   }
 
-  // 6) Paiements liés + délais (normalisation de clés + conversion robuste date)
+  // 5) Paiements liés + délais
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_payments (
       category VARCHAR,
@@ -358,9 +365,11 @@ Rends UNIQUEMENT le JSON demandé.`;
     INSERT INTO catalog_payments
     WITH a_norm AS (
       SELECT
-        ${normKey(`a."${esc(A.order_no)}"`)} AS k_order,
-        ${normKey(`a."${esc(A.line_no)}"`)}  AS k_line,
-        a."${esc(A.fourn)}" AS fournisseur,
+        ${normAlnum(`a."${esc(A.order_no)}"`)} AS k_order_alnum,
+        ${normNum(`a."${esc(A.order_no)}"`)}   AS k_order_num,
+        ${normAlnum(`a."${esc(A.line_no)}"`)}  AS k_line_alnum,
+        ${normNum(`a."${esc(A.line_no)}"`)}    AS k_line_num,
+        ${selOrNull(A.fourn, "fournisseur")},
         CAST(a."${esc(A.order_no)}" AS VARCHAR) AS order_no_raw,
         CAST(a."${esc(A.line_no)}"  AS VARCHAR) AS line_no_raw,
         ${
@@ -370,8 +379,8 @@ Rends UNIQUEMENT le JSON demandé.`;
                 ? `(
                      SELECT ${sqlDateFromAny(`dtl."${esc(dateFallback.col)}"`)}
                      FROM "${esc(dateFallback.table)}" dtl
-                     WHERE ${normKey(`dtl."${esc(dateFallback.order_no)}"`)} = ${normKey(`a."${esc(A.order_no)}"`)}
-                       AND ${normKey(`dtl."${esc(dateFallback.line_no)}"`)}  = ${normKey(`a."${esc(A.line_no)}"`)}
+                     WHERE ${normAlnum(`dtl."${esc(dateFallback.order_no)}"`)} = ${normAlnum(`a."${esc(A.order_no)}"`)}
+                       AND ${normAlnum(`dtl."${esc(dateFallback.line_no)}"`)}  = ${normAlnum(`a."${esc(A.line_no)}"`)}
                      ORDER BY ${sqlDateFromAny(`dtl."${esc(dateFallback.col)}"`)} ASC
                      LIMIT 1
                    )`
@@ -385,8 +394,10 @@ Rends UNIQUEMENT le JSON demandé.`;
     ),
     d_norm AS (
       SELECT
-        ${normKey(`d."${esc(D.order_no)}"`)} AS k_order,
-        ${normKey(`d."${esc(D.line_no)}"`)}  AS k_line,
+        ${normAlnum(`d."${esc(D.order_no)}"`)} AS k_order_alnum,
+        ${normNum(`d."${esc(D.order_no)}"`)}   AS k_order_num,
+        ${normAlnum(`d."${esc(D.line_no)}"`)}  AS k_line_alnum,
+        ${normNum(`d."${esc(D.line_no)}"`)}    AS k_line_num,
         CAST(${sqlDateFromAny(`d."${esc(D.date_pay)}"`)} AS DATE) AS payment_date,
         CAST(d."${esc(D.montant)}" AS DOUBLE) AS montant
       FROM "${esc(decsTable)}" d
@@ -412,15 +423,32 @@ Rends UNIQUEMENT le JSON demandé.`;
       ON a_norm.order_no_raw = m.order_no
      AND a_norm.line_no_raw  = m.line_no
     JOIN d_norm
-      ON a_norm.k_order = d_norm.k_order
+      ON (
+            (a_norm.k_order_alnum IS NOT NULL AND d_norm.k_order_alnum IS NOT NULL AND a_norm.k_order_alnum = d_norm.k_order_alnum)
+         OR (a_norm.k_order_num   IS NOT NULL AND d_norm.k_order_num   IS NOT NULL AND a_norm.k_order_num   = d_norm.k_order_num)
+         )
      AND (
-          (d_norm.k_line IS NOT NULL AND a_norm.k_line = d_norm.k_line)
-          OR (d_norm.k_line IS NULL)
-        );
+            (d_norm.k_line_alnum IS NOT NULL AND a_norm.k_line_alnum IS NOT NULL AND a_norm.k_line_alnum = d_norm.k_line_alnum)
+         OR (d_norm.k_line_num   IS NOT NULL AND a_norm.k_line_num   IS NOT NULL AND a_norm.k_line_num   = d_norm.k_line_num)
+         OR (d_norm.k_line_alnum IS NULL AND d_norm.k_line_num IS NULL)
+         );
   `);
 
-  // 7) État
-  state.taxonomy = taxonomy;
+  // 6) État (canon = uniquement ce qui est utilisé)
+  // Extraire les paires cat/sub réellement utilisées
+  const used = await runSQL(`
+    SELECT DISTINCT category, subcategory FROM catalog_line_map ORDER BY 1,2;
+  `);
+  const byCat = new Map();
+  for (const r of used) {
+    if (!byCat.has(r.category)) byCat.set(r.category, new Set());
+    byCat.get(r.category).add(r.subcategory);
+  }
+  state.taxonomy = Array.from(byCat.entries()).map(([category, set]) => ({
+    category,
+    subcategories: Array.from(set)
+  }));
+
   state.tables.achats  = achatsTable;
   state.tables.decs    = decsTable;
   state.tables.details = detailsTable;
@@ -437,7 +465,7 @@ Rends UNIQUEMENT le JSON demandé.`;
   `);
 
   return {
-    taxonomy,
+    taxonomy: state.taxonomy,
     tables: state.tables,
     cols: state.cols,
     counts,
@@ -558,4 +586,18 @@ export async function getProfile(subcategory, supplier) {
       p75: Number(stats.p75 || 0),
     },
   };
+}
+
+/* =========================================================
+   Utilitaire : garantir présence (cat, sub) dans canon
+   ========================================================= */
+function ensureInCanon(canon, category, subcategory) {
+  if (!category || !subcategory) return;
+  const idx = canon.findIndex(c => c.category === category);
+  if (idx === -1) {
+    canon.push({ category, subcategories: [subcategory] });
+  } else {
+    const subs = canon[idx].subcategories;
+    if (!subs.includes(subcategory)) subs.push(subcategory);
+  }
 }
