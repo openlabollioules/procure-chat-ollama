@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { getSchema, runSQL } from "./db.js";
 
 /* =========================================================
-   Intitulés & alias (élargis)
+   Intitulés & alias
    ========================================================= */
 const COLUMN_ALIASES = {
   achats: {
@@ -42,7 +42,7 @@ const MODEL = process.env.OLLAMA_MODEL || "gpt-oss:20b";
    État
    ========================================================= */
 const state = {
-  taxonomy: /** @type {Array<{category:string, subcategories:string[]}>} */ ([]), // canon final
+  taxonomy: /** @type {Array<{category:string, subcategories:string[]}>} */ ([]),
   tables: { achats: null, decs: null, details: null },
   cols: { achats: {}, decs: {}, details: {} },
   builtAt: null,
@@ -65,8 +65,11 @@ function resolveByAliases(schema, table, aliases) {
   }));
   for (const alias of aliases) {
     const a = lowerDeaccent(alias);
-    let hit = cols.find(c => c.orig === a) || cols.find(c => c.norm === a)
-            || cols.find(c => c.orig.includes(a)) || cols.find(c => c.norm.includes(a));
+    const hit =
+      cols.find(c => c.orig === a) ||
+      cols.find(c => c.norm === a) ||
+      cols.find(c => c.orig.includes(a)) ||
+      cols.find(c => c.norm.includes(a));
     if (hit) return hit.name;
   }
   return null;
@@ -76,7 +79,7 @@ async function llmJSON(messages) {
   const resp = await client.chat.completions.create({ model: MODEL, messages, temperature: 0.2 });
   let txt = resp.choices?.[0]?.message?.content?.trim() || "";
   const m = txt.match(/```json\s*([\s\S]*?)```/i); if (m) txt = m[1].trim();
-  return JSON.parse(txt);
+  return JSON.parse(txt || "{}");
 }
 
 /* ---------- Normalisation clés ---------- */
@@ -84,8 +87,8 @@ const normAlnum = (expr) => `
   NULLIF( regexp_replace(upper(CAST(${expr} AS VARCHAR)), '[^0-9A-Z]+', '', 'g'), '' )
 `;
 const normNum = (expr) => `
-  NULLIF( regexp_replace(regexp_replace(CAST(${expr} AS VARCHAR), '[^0-9]+', '', 'g'), '^0+', '', 'g'), '' )
-`;
+  NULLIF( regexp_replace(regexp_replace(CAST(${expr} AS VARCHAR), '[0-9]+', '\\0', 'g'), '^0+', '', 'g'), '' )
+`.replace("'\\0'", "'\\0'"); // (no-op, keep for clarity)
 
 /* ---------- Dates robustes ---------- */
 function sqlDateFromAny(expr) {
@@ -104,6 +107,28 @@ function sqlDateFromAny(expr) {
 /* ---------- SELECT dynamiques ---------- */
 const selOrNull = (col, alias) => col ? `"${esc(col)}" AS ${alias}` : `NULL AS ${alias}`;
 const condIsNotNull = (col) => col ? `"${esc(col)}" IS NOT NULL` : `FALSE`;
+
+/* =========================================================
+   Introspection DuckDB (fallback quand getSchema() est vide)
+   ========================================================= */
+async function introspectSchemaDuckDB() {
+  const tables = await runSQL(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+    ORDER BY table_name;
+  `);
+  const out = {};
+  for (const t of tables) {
+    const name = t.table_name;
+    const cols = await runSQL(`PRAGMA table_info('${String(name).replace(/'/g,"''")}');`);
+    out[name] = cols.map(c => ({
+      name: c.name,
+      original: c.name,
+    }));
+  }
+  return out;
+}
 
 /* =========================================================
    Détection robuste des rôles de table (Achats / Décaissements / Détails)
@@ -161,7 +186,11 @@ function pickTablesBySignature(schema) {
    Build: classification incrémentale + paiements
    ========================================================= */
 export async function buildCatalog() {
-  const schema = getSchema();
+  // Schéma + fallback
+  let schema = getSchema();
+  if (!schema || !Object.keys(schema).length) {
+    schema = await introspectSchemaDuckDB();
+  }
 
   // 1) Trouver les tables par signature (évite les mélanges)
   const picked = pickTablesBySignature(schema);
@@ -198,13 +227,13 @@ export async function buildCatalog() {
     }
   }
 
-  // 2) Vérifs min : uniquement les clés Achats + décaissements requis
+  // Vérifs min : uniquement les clés Achats + décaissements requis
   if (!A.order_no || !A.line_no) throw new Error("Colonnes clés manquantes dans Achats (N° commande / N° ligne).");
   if (!D.order_no || !D.line_no || !D.montant || !D.date_pay) {
     throw new Error("Colonnes clés manquantes dans Décaissements (commande/ligne + montant + date paiement).");
   }
 
-  // 3) Préparer les lignes Achats (on ne dépend pas d’un champ textuel unique)
+  // Champs textuels ? (au moins un)
   const hasAnyTextField = Boolean(A.type_ligne || A.desc_cmd || A.desc_line);
   if (!hasAnyTextField) {
     throw new Error(
@@ -213,7 +242,7 @@ export async function buildCatalog() {
     );
   }
 
-  // Table de mapping lignes -> catégories (sera reconstruite)
+  // Table mapping lignes -> catégories (reconstruite)
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_line_map (
       order_no VARCHAR,
@@ -237,11 +266,10 @@ export async function buildCatalog() {
     FROM "${esc(achatsTable)}";
   `);
 
-  // 4) Classification INCRÉMENTALE
-  // La liste canonique se construit au fur et à mesure (initialement vide)
+  // Classification INCRÉMENTALE
   let canon = /** @type {{category:string, subcategories:string[]}[]} */ ([]);
-
   const batchSize = 120;
+
   for (let i = 0; i < lines.length; i += batchSize) {
     const chunk = lines.slice(i, i + batchSize);
     const items = chunk.map(r => ({
@@ -254,10 +282,9 @@ export async function buildCatalog() {
 
     const systemClass = `Tu construis un catalogue de catégories d'achats en français de manière incrémentale.
 RÈGLES IMPORTANTES:
-- Tu NE dois PAS inventer de catégories hors contexte : tu ne proposes que des catégories pertinentes pour les items fournis.
-- Tu peux réutiliser une catégorie/sous-catégorie existante si elle convient.
-- Tu peux créer une NOUVELLE catégorie/sous-catégorie si nécessaire, mais uniquement si elle est réellement justifiée par les items présents.
-- Si une nouvelle proposition est équivalente ou très proche d'une existante, utilise l'existante (et signale l'alias).
+- Tu NE dois PAS inventer de catégories hors contexte : uniquement pertinentes pour les items fournis.
+- Réutilise une catégorie existante si elle convient; sinon crée-en une nouvelle justifiée.
+- Fusionne les doublons évidents via "aliases".
 - Réponds UNIQUEMENT en JSON.`;
 
     const userClass = `Catalogue actuel (canonique):
@@ -277,12 +304,7 @@ FORMAT JSON STRICT attendu:
   "new_categories": [
     {"category":"<cat>","subcategories":["<sub1>","<sub2>", "..."]}
   ]
-}
-
-Contraintes:
-- "assignments" doit couvrir TOUS les items donnés.
-- "aliases" est optionnel. Utilise-le seulement si tu estimes qu'une proposition devrait pointer vers une catégorie existante.
-- "new_categories" propose uniquement des catégories/sous-catégories utiles pour ces items.`;
+}`;
 
     let out;
     try {
@@ -291,7 +313,6 @@ Contraintes:
         { role: "user", content: userClass },
       ]);
     } catch {
-      // en cas d'erreur parsing, fallback trivial: tout ranger dans "Autre"
       out = {
         assignments: items.map(it => ({ key: it.key, category: "Autre", subcategory: "Autre" })),
         aliases: [],
@@ -303,19 +324,14 @@ Contraintes:
     const aliases = Array.isArray(out?.aliases) ? out.aliases : [];
     const newCats = Array.isArray(out?.new_categories) ? out.new_categories : [];
 
-    // Appliquer les alias (fusion de libellés vers canon)
+    // Appliquer alias → s’assurer que la cible est dans le canon
     for (const a of aliases) {
-      const fromC = (a?.from?.category || "").trim();
-      const fromS = (a?.from?.subcategory || "").trim();
-      const toC   = (a?.to?.category || "").trim();
-      const toS   = (a?.to?.subcategory || "").trim();
-      if (!fromC || !fromS || !toC || !toS) continue;
-      // Pas besoin de stocker une table de correspondance persistante : on s'assure que canon contient la cible
-      ensureInCanon(canon, toC, toS);
-      // Les assignments arrivant déjà "to" n'ont pas à être réécrits ici.
+      const toC = String(a?.to?.category || "").trim();
+      const toS = String(a?.to?.subcategory || "").trim();
+      if (toC && toS) ensureInCanon(canon, toC, toS);
     }
 
-    // Ajouter/actualiser le canon avec les nouvelles catégories proposées
+    // Ajouter nouvelles catégories proposées
     for (const nc of newCats) {
       const cat = String(nc?.category || "").trim();
       const subs = (nc?.subcategories || []).map(s => String(s || "").trim()).filter(Boolean);
@@ -323,14 +339,14 @@ Contraintes:
       for (const sub of subs) ensureInCanon(canon, cat, sub);
     }
 
-    // S'assurer que toutes les (cat, sub) des assignments sont dans le canon
+    // S’assurer que toutes les (cat, sub) des assignments existent
     for (const asg of assignments) {
       const cat = String(asg?.category || "").trim();
       const sub = String(asg?.subcategory || "").trim();
       if (cat && sub) ensureInCanon(canon, cat, sub);
     }
 
-    // Insérer les affectations en base
+    // Insert en base
     for (const asg of assignments) {
       const [order_no, line_no] = String(asg.key || "").split("|||");
       const category   = String(asg.category || "").trim();
@@ -345,7 +361,7 @@ Contraintes:
     }
   }
 
-  // 5) Paiements liés + délais
+  // Paiements liés + délais
   await runSQL(`
     CREATE TABLE IF NOT EXISTS catalog_payments (
       category VARCHAR,
@@ -434,11 +450,8 @@ Contraintes:
          );
   `);
 
-  // 6) État (canon = uniquement ce qui est utilisé)
-  // Extraire les paires cat/sub réellement utilisées
-  const used = await runSQL(`
-    SELECT DISTINCT category, subcategory FROM catalog_line_map ORDER BY 1,2;
-  `);
+  // État (canon = uniquement ce qui est utilisé)
+  const used = await runSQL(`SELECT DISTINCT category, subcategory FROM catalog_line_map ORDER BY 1,2;`);
   const byCat = new Map();
   for (const r of used) {
     if (!byCat.has(r.category)) byCat.set(r.category, new Set());
@@ -519,7 +532,7 @@ export async function getSummary() {
 }
 
 /* =========================================================
-   Profil d'écoulement
+   Profil d'écoulement (quartiles + debug)
    ========================================================= */
 export async function getProfile(subcategory, supplier) {
   if (!subcategory || !supplier) throw new Error("Paramètres requis: subcategory & supplier.");
@@ -547,7 +560,7 @@ export async function getProfile(subcategory, supplier) {
     WHERE subcategory = ${q(subcategory)}
       AND fournisseur = ${q(supplier)};
   `);
-  const total = Number(totRow?.[0]?.s || 0);
+  const total = Number((totRow && totRow.length ? totRow[0].s : 0) || 0);
 
   const cumulative = [];
   let acc = 0;
@@ -561,23 +574,34 @@ export async function getProfile(subcategory, supplier) {
     });
   }
 
-  const stats =
-    (await runSQL(`
-      SELECT
-        CAST(COUNT(*) AS INT)           AS n_payments,
-        COALESCE(SUM(montant),0)        AS total,
-        CAST(quantile_cont(delay_days, 0.5) AS INT)  AS median_delay,
-        CAST(quantile_cont(delay_days, 0.25) AS INT) AS p25,
-        CAST(quantile_cont(delay_days, 0.75) AS INT) AS p75
-      FROM catalog_payments
-      WHERE subcategory = ${q(subcategory)}
-        AND fournisseur = ${q(supplier)};
-    `))?.[0] || { n_payments: 0, total: 0, median_delay: 0, p25: 0, p75: 0 };
+  const statsRows = await runSQL(`
+    SELECT
+      CAST(COUNT(*) AS INT)                AS n_payments,
+      COALESCE(SUM(montant),0)             AS total,
+      CAST(quantile_cont(delay_days, 0.5)  AS INT) AS median_delay,
+      CAST(quantile_cont(delay_days, 0.25) AS INT) AS p25,
+      CAST(quantile_cont(delay_days, 0.75) AS INT) AS p75
+    FROM catalog_payments
+    WHERE subcategory = ${q(subcategory)}
+      AND fournisseur = ${q(supplier)};
+  `);
+  const stats = (statsRows && statsRows.length)
+    ? statsRows[0]
+    : { n_payments: 0, total: 0, median_delay: 0, p25: 0, p75: 0 };
+
+  // Quartiles cumulés (écoulement)
+  const quartiles = {};
+  const thresholds = [0.25, 0.5, 0.75, 1.0];
+  for (const t of thresholds) {
+    const qpoint = cumulative.find(c => c.share >= t);
+    if (qpoint) quartiles[t] = { delay_days: qpoint.delay_days, cum_amount: qpoint.cum_amount };
+  }
 
   return {
     series,
     points,
     cumulative,
+    debugPoints: points, // debug complet pour le front
     stats: {
       n_payments: Number(stats.n_payments || 0),
       total: Number(stats.total || 0),
@@ -585,7 +609,37 @@ export async function getProfile(subcategory, supplier) {
       p25: Number(stats.p25 || 0),
       p75: Number(stats.p75 || 0),
     },
+    quartiles
   };
+}
+
+/* =========================================================
+   Export / Import catalogue
+   ========================================================= */
+export async function exportCatalog() {
+  const mappings = await runSQL(`SELECT * FROM catalog_line_map;`);
+  return {
+    taxonomy: state.taxonomy,
+    mappings,
+    builtAt: state.builtAt
+  };
+}
+
+export async function importCatalog(data) {
+  if (!data || !Array.isArray(data.taxonomy)) throw new Error("Catalogue invalide");
+  state.taxonomy = data.taxonomy;
+  state.builtAt = new Date();
+
+  if (Array.isArray(data.mappings)) {
+    await runSQL(`DELETE FROM catalog_line_map;`);
+    for (const m of data.mappings) {
+      await runSQL(`
+        INSERT INTO catalog_line_map (order_no, line_no, category, subcategory, fournisseur)
+        VALUES (${q(m.order_no)}, ${q(m.line_no)}, ${q(m.category)}, ${q(m.subcategory)}, ${q(m.fournisseur)});
+      `);
+    }
+  }
+  return { ok: true };
 }
 
 /* =========================================================

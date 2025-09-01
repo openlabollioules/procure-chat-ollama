@@ -14,8 +14,6 @@ import {
   Copy,
   Download,
   RefreshCw,
-  ChevronDown,
-  ChevronUp,
   FolderTree,
   Wand2,
   Building2,
@@ -66,6 +64,9 @@ type ProfileResp = {
   series: { delay_days: number; montant_total: number }[];
   cumulative: { delay_days: number; cum_amount: number; share: number }[];
   stats: { n_payments: number; total: number; median_delay: number; p25: number; p75: number };
+  // --- ajouts minimaux :
+  quartiles?: Record<string, { delay_days: number; cum_amount: number }>;
+  debugPoints?: { delay_days: number; montant: number; payment_date: string; order_no: string; line_no: string }[];
 };
 
 function Badge({ color = "#e5e7eb", text }: { color?: string; text: string }) {
@@ -276,6 +277,9 @@ export default function App() {
     const r = await fetch(`${API}/catalog/profile?${q.toString()}`);
     const j: any = await r.json();
     if (j.error) { alert(j.error); return; }
+    // --- logs debug minimaux demandés :
+    if (j.debugPoints) console.log("DEBUG profile.debugPoints:", j.debugPoints);
+    if (j.cumulative) console.log("DEBUG profile.cumulative:", j.cumulative);
     setProfile(j as ProfileResp);
   }
 
@@ -286,6 +290,41 @@ export default function App() {
 
   const subcats = useMemo(() => (cat && summary ? summary.byCategory[cat] || [] : []), [cat, summary]);
   const suppliers = useMemo(() => (sub && summary ? summary.bySubcategorySupplier[sub] || [] : []), [sub, summary]);
+
+  // --- AJOUTS MINIMAUX: Export / Import JSON ---
+  async function exportCatalogJSON() {
+    try {
+      const res = await fetch(`${API}/catalog/export`);
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "catalogue.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    }
+  }
+
+  async function importCatalogJSON(file?: File | null) {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const json = JSON.parse(text);
+      await fetch(`${API}/catalog/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(json),
+      });
+      await fetchSummary();
+      alert("Catalogue importé");
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    }
+  }
+  const importRef = useRef<HTMLInputElement>(null);
 
   return (
     <div
@@ -492,6 +531,23 @@ export default function App() {
                 <FolderTree />
                 <div style={{ fontWeight: 700 }}>Catalogue de catégories</div>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                  {/* --- boutons ajoutés (export/import) --- */}
+                  <button
+                    onClick={exportCatalogJSON}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}
+                    title="Exporter le catalogue en JSON"
+                  >
+                    <Download size={16} /> Exporter
+                  </button>
+                  <button
+                    onClick={() => importRef.current?.click()}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}
+                    title="Importer un catalogue JSON"
+                  >
+                    <UploadCloud size={16} /> Importer
+                  </button>
+                  <input ref={importRef} type="file" accept="application/json" onChange={(e) => importCatalogJSON(e.target.files?.[0] || null)} style={{ display: "none" }} />
+                  {/* --- bouton existant build --- */}
                   <button onClick={buildCatalog} disabled={building} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: building ? "#94a3b8" : "#111827", color: "#fff", border: 0, borderRadius: 10, padding: "10px 14px", cursor: building ? "not-allowed" : "pointer" }}>
                     <Wand2 size={16} /> {building ? "Construction…" : "Construire / Mettre à jour"}
                   </button>
@@ -579,18 +635,30 @@ export default function App() {
                   <Loader2 className="spin" size={16} /> Chargement du profil…
                 </div>
               ) : (
-                <div style={{ height: 360 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={profile.series} margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="delay_days" label={{ value: "Délai (jours)", position: "insideBottom", offset: -5 }} />
-                      <YAxis label={{ value: "Montant", angle: -90, position: "insideLeft" }} />
-                      <Tooltip />
-                      <Legend />
-                      <Bar dataKey="montant_total" name="Montant par délai" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
+                <>
+                  <div style={{ height: 360 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={profile.series} margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="delay_days" label={{ value: "Délai (jours)", position: "insideBottom", offset: -5 }} />
+                        <YAxis label={{ value: "Montant", angle: -90, position: "insideLeft" }} />
+                        <Tooltip />
+                        <Legend />
+                        <Bar dataKey="montant_total" name="Montant par délai" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* --- AJOUT minimal : bloc quartiles --- */}
+                  {profile.quartiles && (
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>Quartiles d'écoulement</div>
+                      <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 12, padding: 12 }}>
+                        <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{JSON.stringify(profile.quartiles, null, 2)}</pre>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
             </section>
           </>

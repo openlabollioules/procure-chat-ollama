@@ -1,0 +1,238 @@
+/* client/src/app.css */
+
+/* Reset léger */
+:root {
+    --bg: #0b0d10;
+    --panel: #12151a;
+    --text: #e7edf3;
+    --muted: #9aa7b2;
+    --accent: #3aa0ff;
+    --border: #22303b;
+    --success: #20c997;
+  }
+  
+  * { box-sizing: border-box; }
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  }
+  
+  /* Layout de l'app */
+  .app {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  header h1 {
+    font-size: 18px;
+    margin: 0;
+  }
+  header nav {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+  }
+  header nav button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  header nav button.active {
+    background: var(--panel);
+    border-color: var(--accent);
+  }
+  
+  /* Boutons généraux */
+  button, .import {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+  }
+  button:hover, .import:hover {
+    border-color: var(--accent);
+  }
+  button:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .import {
+    position: relative;
+    overflow: hidden;
+  }
+  .import input[type="file"] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  
+  /* Cartes & grille */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .card h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+  }
+  .card h4 {
+    margin: 12px 0 6px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  
+  /* Inputs */
+  select, input[type="text"] {
+    width: 100%;
+    background: #0f1217;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    outline: none;
+  }
+  select:focus, input[type="text"]:focus {
+    border-color: var(--accent);
+  }
+  
+  /* Toolbar catalogue */
+  .toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .toolbar .spacer { flex: 1; }
+  
+  /* Tableau debug */
+  .tablewrap {
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid #1a2330;
+    white-space: nowrap;
+  }
+  th {
+    background: #0f1217;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  
+  /* Stats */
+  .stat {
+    background: #0f1217;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    min-width: 120px;
+  }
+  .stat .label {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .stat .value {
+    font-size: 16px;
+    margin-top: 2px;
+  }
+  
+  /* Vue Chat */
+  .chat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    min-height: 70vh;
+    display: flex;
+    flex-direction: column;
+  }
+  .messages {
+    flex: 1;
+    padding: 12px;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .msg {
+    background: #0f1217;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    max-width: 85%;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: #0e1a24;
+    border-color: #1f2c3a;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+  }
+  .inputbar {
+    position: relative;
+    border-top: 1px solid var(--border);
+    padding: 10px 12px 12px;
+    display: flex;
+    gap: 8px;
+  }
+  .inputbar input {
+    flex: 1;
+    background: #0b0f14;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    padding: 10px 36px 10px 12px;
+    outline: none;
+  }
+  .inputbar .upload {
+    position: relative;
+    overflow: hidden;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .inputbar .upload input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  
