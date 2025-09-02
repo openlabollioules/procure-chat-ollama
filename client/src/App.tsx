@@ -454,7 +454,15 @@ export default function App() {
                     onChange={(e) => setInput(e.target.value)}
                     placeholder="Ex: Top 20 des décaissements 2024 par fournisseur avec n° de commande"
                     onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) onSend(); }}
-                    style={{ width: "100%", padding: "12px 44px 12px 12px", border: "1px solid #e5e7eb", borderRadius: 12, outline: "none", fontSize: 14 }}
+                    style={{ 
+                      width: "100%", 
+                      padding: "12px 44px 12px 12px", 
+                      border: "1px solid #e5e7eb", 
+                      borderRadius: 12, 
+                      outline: "none", 
+                      fontSize: 14,
+                      boxSizing: "border-box"
+                    }}
                   />
                   <button
                     type="button"
@@ -473,9 +481,6 @@ export default function App() {
                     <Send size={18} />
                   </button>
                 </div>
-                <button onClick={onSend} disabled={loadingChat} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: loadingChat ? "#94a3b8" : "#2563eb", color: "white", border: 0, borderRadius: 12, padding: "10px 14px", cursor: loadingChat ? "not-allowed" : "pointer" }}>
-                  <PlayCircle size={18} /> Poser la question
-                </button>
               </div>
             </section>
 
@@ -543,10 +548,10 @@ export default function App() {
                     <Wand2 size={16} /> {building ? "Construction…" : "Construire / Mettre à jour"}
                   </button>
                   <button onClick={exportCatalogJSON} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}>
-                    <Download size={16} /> Exporter JSON
+                    <Download size={16} /> Exporter le catalogue
                   </button>
                   <button onClick={() => jsonRef.current?.click()} style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#e5e7eb", color: "#111827", border: 0, borderRadius: 10, padding: "10px 14px", cursor: "pointer" }}>
-                    <UploadCloud size={16} /> Importer JSON
+                    <UploadCloud size={16} /> Importer le catalogue
                   </button>
                   <input
                     ref={jsonRef}

@@ -51,17 +51,33 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
+// Fonction pour convertir les BigInt en string pour la sérialisation JSON
+function serializeBigInt(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'bigint') return obj.toString();
+  if (Array.isArray(obj)) return obj.map(serializeBigInt);
+  if (typeof obj === 'object') {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = serializeBigInt(value);
+    }
+    return result;
+  }
+  return obj;
+}
+
 /* ---------------- Chat analytique : LLM -> SQL -> DuckDB ----------------
    - Le LLM (Ollama API OpenAI-compatible) génère une requête SQL DuckDB (SELECT…)
    - On exécute la requête avec safeRun (bloque DDL/DML)
 ------------------------------------------------------------------------ */
 app.post('/chat', async (req, res) => {
   try {
-    const question = String(req.body?.message || '').trim();
-    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const { message: question, history = [] } = req.body;
+    if (!question?.trim()) {
+      return res.status(400).json({ error: 'Message requis.' });
+    }
 
-    // Schéma courant tenu par db.js (tables/colonnes/types)
-    const schema = getSchema() || {};
+    const schema = getSchema();
 
     // 1) Demande au LLM une requête SQL DuckDB SÉLECT uniquement
     const sql = await suggestSQL({ schema, question, history });
@@ -69,7 +85,10 @@ app.post('/chat', async (req, res) => {
     // 2) Exécution sécurisée (refuse CREATE/INSERT/UPDATE/DELETE/…)
     const rows = await safeRun(sql);
 
-    res.json({ sql, rows });
+    // 3) Conversion des BigInt en string pour la sérialisation JSON
+    const serializedRows = serializeBigInt(rows);
+
+    res.json({ sql, rows: serializedRows });
   } catch (e) {
     console.error('[/chat] error:', e);
     res.status(500).json({ error: String(e?.message || e) });
